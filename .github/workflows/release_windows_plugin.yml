@@ -1,0 +1,46 @@
+name: Release Windows CS2 Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release x64
+        run: msbuild /m /p:Configuration=Release /p:Platform=x64 cs2-server-plugin.sln
+
+      - name: Package server.dll
+        shell: pwsh
+        run: |
+          $dllPath = "static/cs2/server.dll"
+          if (!(Test-Path $dllPath)) {
+            throw "Build output not found: $dllPath"
+          }
+
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          Copy-Item $dllPath "dist/server.dll" -Force
+
+          $zipName = "cs2-server-plugin-$env:GITHUB_REF_NAME-windows.zip"
+          Compress-Archive -Path "dist/server.dll" -DestinationPath $zipName -Force
+          "ASSET_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ${{ env.ASSET_PATH }}

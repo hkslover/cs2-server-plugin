@@ -1,0 +1,6 @@
+.DS_Store
+.vs
+*.user
+Debug/
+Release/
+*.dll
