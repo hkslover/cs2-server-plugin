@@ -1,7 +1,6 @@
 name: Release Windows CS2 Plugin
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
