@@ -21,6 +21,10 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
+      - name: Prepare output directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path "static/cs2" -Force | Out-Null
+
       - name: Build Release x64
         run: msbuild /m /p:Configuration=Release /p:Platform=x64 cs2-server-plugin.sln
 
