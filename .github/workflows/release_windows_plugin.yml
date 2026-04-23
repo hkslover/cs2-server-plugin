@@ -26,7 +26,7 @@ jobs:
         run: New-Item -ItemType Directory -Path "static/cs2" -Force | Out-Null
 
       - name: Build Release x64
-        run: msbuild /m /p:Configuration=Release /p:Platform=x64 cs2-server-plugin.sln
+        run: msbuild /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="${{ github.workspace }}\\static\\cs2\\" cs2-server-plugin.sln
 
       - name: Package server.dll
         shell: pwsh
