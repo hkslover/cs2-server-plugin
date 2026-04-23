@@ -29,19 +29,51 @@ jobs:
       - name: Build Release x64
         run: msbuild /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="${{ github.workspace }}\\static\\cs2\\" cs2-server-plugin.sln
 
+      - name: Generate changelog.xml
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          if ($version.StartsWith("v")) {
+            $version = $version.Substring(1)
+          }
+
+          $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $sourceCommit = $env:GITHUB_SHA
+
+          $xml = @"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <changelog>
+            <release>
+              <name>cs2-server-plugin</name>
+              <version>$version</version>
+              <time>$timestamp</time>
+              <changes>
+                <change type="updated">Auto build from commit $sourceCommit.</change>
+              </changes>
+            </release>
+          </changelog>
+          "@
+
+          $xml | Out-File -FilePath "static/cs2/changelog.xml" -Encoding utf8
+
       - name: Package server.dll
         shell: pwsh
         run: |
           $dllPath = "static/cs2/server.dll"
+          $changelogPath = "static/cs2/changelog.xml"
           if (!(Test-Path $dllPath)) {
             throw "Build output not found: $dllPath"
+          }
+          if (!(Test-Path $changelogPath)) {
+            throw "Build output not found: $changelogPath"
           }
 
           New-Item -ItemType Directory -Path "dist" -Force | Out-Null
           Copy-Item $dllPath "dist/server.dll" -Force
+          Copy-Item $changelogPath "dist/changelog.xml" -Force
 
           $zipName = "cs2-server-plugin-$env:GITHUB_REF_NAME-windows.zip"
-          Compress-Archive -Path "dist/server.dll" -DestinationPath $zipName -Force
+          Compress-Archive -Path "dist/server.dll", "dist/changelog.xml" -DestinationPath $zipName -Force
           "ASSET_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Create Release
