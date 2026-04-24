@@ -424,10 +424,6 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
                         SendMsg(BuildDemoDoneMessage(activeDemoPath, "disconnect"));
                         activeDemoPath.clear();
                     }
-                    if (action.cmd == "quit") {
-                        SendMsg(BuildDemoDoneMessage(activeDemoPath, "quit"));
-                        activeDemoPath.clear();
-                    }
                 }
             }
         }
@@ -458,10 +454,6 @@ void HandleWebSocketMessage(const std::string& message)
         string cmd = "playdemo \"" + requestedDemoPath + "\"";
         QueueEngineCommand(cmd);
         SendMsg(BuildDemoStartedMessage(activeDemoPath));
-    }
-    else if (msg["name"] == "quit") {
-        SendStatusOk();
-        QueueEngineCommand("quit");
     }
     else if (msg["name"] == "capture-player-view") {
         Log("Capturing player view");

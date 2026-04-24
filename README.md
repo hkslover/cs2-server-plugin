@@ -14,7 +14,6 @@ Compared with the upstream CS2 plugin in `cs-demo-manager`, this repo includes i
   - `record_status`
   - `demo_started`
   - `demo_done`
-- Added WebSocket command handling for `quit` so the tool can terminate the game process after queue completion.
 
 The goal is to keep plugin behavior compatible with upstream while enabling real-time recording state tracking in the external tool.
 
