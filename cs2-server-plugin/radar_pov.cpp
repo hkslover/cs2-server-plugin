@@ -484,26 +484,54 @@ void* __fastcall Hook_GetEntityBySlot(int slot)
     return g_origGetEntityBySlot(slot);
 }
 
-int ReadControllerTeam(void* controller)
+// m_iTeamNum @ +0x3E7 on pawn and controller (engine uses this in e328a0 / 85b540).
+int ReadEntityTeam(void* ent)
 {
-    if (controller == nullptr) {
+    if (ent == nullptr) {
         return 0;
     }
     __try {
         return static_cast<unsigned char>(
-            *(reinterpret_cast<uint8_t*>(controller) + kControllerTeamOffset));
+            *(reinterpret_cast<uint8_t*>(ent) + kControllerTeamOffset));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
 }
 
+// Refresh observed team: pawn first (reliable in demos), then controller slot.
+int RefreshPovSelfTeam()
+{
+    int team = ReadEntityTeam(g_povSelfPawn);
+    if (team != kTeamT && team != kTeamCT && g_origGetEntityBySlot != nullptr &&
+        g_povSelfSlot >= 0) {
+        void* ctrl = nullptr;
+        __try {
+            ctrl = g_origGetEntityBySlot(g_povSelfSlot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ctrl = nullptr;
+        }
+        team = ReadEntityTeam(ctrl);
+    }
+    if (team == kTeamT || team == kTeamCT) {
+        g_povSelfTeam = team;
+    }
+    return g_povSelfTeam;
+}
+
 // True only for same T/CT as the observed player (never spectators / enemies).
 bool IsPovTeammateTeam(int playerTeam)
 {
-    if (g_povSelfTeam != kTeamT && g_povSelfTeam != kTeamCT) {
+    if (playerTeam != kTeamT && playerTeam != kTeamCT) {
         return false;
     }
-    return playerTeam == g_povSelfTeam;
+    int selfTeam = g_povSelfTeam;
+    if (selfTeam != kTeamT && selfTeam != kTeamCT) {
+        selfTeam = RefreshPovSelfTeam();
+    }
+    if (selfTeam != kTeamT && selfTeam != kTeamCT) {
+        return false;
+    }
+    return playerTeam == selfTeam;
 }
 
 void PreparePovContext()
@@ -551,17 +579,7 @@ void PreparePovContext()
             g_povSelfSlot = povSlot;
         }
     }
-    // Team for teammate-only competitive colours (controller array by slot).
-    if (g_origGetEntityBySlot != nullptr && g_povSelfSlot >= 0) {
-        void* ctrl = nullptr;
-        __try {
-            // Call original: slot is already the observed player, not 0/-1 remap.
-            ctrl = g_origGetEntityBySlot(g_povSelfSlot);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            ctrl = nullptr;
-        }
-        g_povSelfTeam = ReadControllerTeam(ctrl);
-    }
+    RefreshPovSelfTeam();
     if (g_logPovOk.fetch_add(1) == 0) {
         Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)",
             realPawn, povPawn, g_povSelfSlot, g_povSelfTeam, g_spectatorSlot);
@@ -771,7 +789,17 @@ void ForceCompetitiveIconColor(void* icon)
             return;
         }
 
-        const int playerTeam = ReadControllerTeam(controller);
+        int playerTeam = ReadEntityTeam(controller);
+        // Engine passes subject team into SetRadarIconType; controller netvar can lag.
+        // Prefer a valid T/CT team for filtering.
+        if (playerTeam != kTeamT && playerTeam != kTeamCT) {
+            // Infer from icon type we (or native) assigned: 9=T, 0xD=CT.
+            if (type == kIconTypeT) {
+                playerTeam = kTeamT;
+            } else if (type == kIconTypeCT) {
+                playerTeam = kTeamCT;
+            }
+        }
         // Competitive palette is teammates only; enemies stay native red/default.
         if (!IsPovTeammateTeam(playerTeam)) {
             return;
