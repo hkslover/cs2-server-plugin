@@ -1,4 +1,4 @@
 interface:
   display_name: "CS2 Radar POV Maintenance"
-  short_description: "维护 CS2 Demo 第一视角雷达逆向与兼容工作流"
-  default_prompt: "Use $radar-pov-maintenance to inspect and update CS2 radar POV compatibility after a client.dll update."
+  short_description: "维护已验证的 7-hook Demo 第一视角雷达（身份 + 队友独立色）"
+  default_prompt: "Use $radar-pov-maintenance and read references/current-implementation.md, then diagnose or update radar_pov.cpp after a client.dll change. Prefer the validated 7-hook design; do not re-add dropped colour-gate hooks without evidence."

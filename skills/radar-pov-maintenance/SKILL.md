@@ -1,77 +1,115 @@
 ---
 name: radar-pov-maintenance
-description: Maintain and update the CS2 demo first-person radar implementation in this repository. Use when radar POV visuals regress, client.dll changes after a CS2 update, radar hooks or signatures fail, or when reverse engineering and validating the native radar path with Ghidra.
+description: Maintain and update the CS2 demo first-person radar (radar_pov.cpp). Use when radar POV regresses, client.dll updates break hooks/signatures, teammate competitive colours are wrong, or when revalidating the native radar path with Ghidra.
 ---
 
 # CS2 Radar POV Maintenance
 
-Maintain `radar_pov.cpp` so a CS2 demo observer follows the same native radar
-rendering path as a live first-person player. Read
-`references/current-implementation.md` before changing code; it records the
-current proven control points and the validation contract.
+Maintain `cs2-server-plugin/radar_pov.cpp` so demo freecam/spectate follow uses
+the same radar **feel** as live first-person: rotating map, teammate competitive
+colours (not solid team orange/blue for allies), native enemy spotting, and no
+freecam spectator blob.
+
+Read **`references/current-implementation.md`** first. It is the source of truth
+for the validated 7-hook design, Ghidra anchors, and healthy-log contract.
+
+## Goal (validated contract)
+
+| Expectation | Notes |
+| --- | --- |
+| Live-style layout / rotation | Identity + scoped non-demo |
+| Teammates: distinct competitive colours | force ARGB via engine `cl_teammate_color_*` palette |
+| Enemies: **not** competitive palette | teammate-only filter (`g_povSelfTeam`) |
+| No freecam spectator icon | `findPlayerBySlot` filter |
+| No forced radar cvars | `RadarPov_QueueEngineSetup` is empty |
+
+A hook success log is **not** enough. Confirm in a demo with rotation on.
 
 ## Start with evidence
 
-1. Work from `cs2-server-plugin` and preserve unrelated working-tree changes.
-2. Record the current `client.dll` fingerprint (at least PE timestamp) and
-   inspect a fresh `csdm.log` before changing signatures or hooks.
-3. Classify the failure before editing:
-   - installation/signature failure;
-   - wrong local pawn or observer target;
-   - spectator/demo presentation state leaking into radar;
-   - stale spectator slot rendered as a player;
-   - native radar still receiving the wrong mode/state.
-4. Treat a hook log as proof only that the hook executed. Confirm visual
-   behavior in a demo: rotation, team colors, spotted enemies, sound question
-   marks, and dead-enemy crosses.
+1. Work under `cs2-server-plugin`; do not discard unrelated local changes.
+2. Note `client.dll` PE timestamp from log (`Radar POV: client.dll @ ... PE-timestamp=...`).
+3. Read a full `csdm.log` install + first POV frame.
+4. Classify before editing:
 
-## Reverse-engineer the native path
+| Symptom | Likely layer |
+| --- | --- |
+| Install fails / missing MinHook lines | Signature / resolve |
+| Empty radar or no rotation | Identity (`getLocal` / demo / update scope) |
+| Solid team colours for allies | Colour path (type / force-color / self team = 0) |
+| Enemies also competitive-coloured | Teammate filter broken |
+| Extra freecam dot | `findPlayerBySlot` |
+| Exceptions in hooks | Bad entity type or panel vtable |
 
-Use Ghidra and its bridge when available. First use a bridge path explicitly
-provided by the user. Otherwise, search the current workspace for the bridge
-script or an existing Ghidra MCP configuration; do not assume a fixed folder
-layout or start a second bridge when one is already running. Once available,
-use its endpoint to inspect the current `client.dll`, for example:
+## Architecture (why not one hook)
 
-```sh
-curl 'http://127.0.0.1:8080/decompile_function?address=0x180e25550'
+Demo and live share **one** radar update chain. Branches re-query independently:
+
+1. **Who is local (pawn)** — `getLocal`
+2. **Who is local (controller)** — `GetEntityBySlot(0)` (colour path; **not** getLocal)
+3. **Is demo/HLTV** — engine vtable `+0x2B0` (scoped false during POV)
+4. **Icon type** — live teammates become type `0x11`; competitive RGB in
+   `FUN_180e460e0` only paints types `9` / `0xD`
+5. **Actual ARGB** — demo netvars/gates often no-op; validated path **force-paints**
+   after native `e460e0` using engine palette helpers
+
+Identity rewrite alone opens the live branch but leaves type `0x11` → solid team
+panels. Colour-gate-only hooks without force-paint were insufficient in demos.
+
+**Do not reintroduce** dropped hooks unless evidence requires them:
+
+- `IsSpectatorCheck` force-return
+- presentation selector force
+- `shouldApplyCompColor` / `getCompTeammateColor` (removed; force-color covers)
+
+## Reverse engineering
+
+Prefer Ghidra bridge when the user has it (e.g. `http://127.0.0.1:8080/`). Use
+an endpoint the user provides; do not assume a fixed layout or start a second
+bridge if one is running.
+
+Rediscover by **role**, not stale absolute VA:
+
+```text
+cl_radar_show_all_players_when_spectating
+  → ConVar LEA → radar_mode (FUN_180e1f000 class)
+  → outer radar update wrapper (FUN_180e25550 class)
+  → players loop (FUN_180e328a0)
+  → set type (FUN_180e39320) / colour (FUN_180e460e0)
+  → GetEntityBySlot (FUN_180926920) + IsSpectatorCheck (FUN_18085b540)
 ```
 
-For the updated client, rediscover semantics rather than copying old absolute
-addresses. Follow the outer radar update into the radar-mode selector, player
-enumeration/update, local-player lookup, observer-target lookup, and the
-presentation-state selector. Use xrefs and callers to establish what each
-function does. Prefer module-relative RVAs and runtime extraction from nearby
-instructions over fixed virtual addresses or field offsets.
+Useful API examples:
 
-## Implement minimally and fail closed
+```sh
+curl -s "http://127.0.0.1:8080/decompile_function?address=0x180e460e0"
+curl -s "http://127.0.0.1:8080/decompile_function?address=0x180e39320"
+curl -s "http://127.0.0.1:8080/xrefs_to?address=0x18085b540&limit=20"
+```
 
-Keep the client renderer responsible for drawing. The plugin should only make
-the radar update perceive the observed pawn as the local player and suppress
-demo/spectator state while the scoped radar update runs.
+Prefer instruction relationships + prologue masks over single brittle immediates
+(e.g. `mov edi,eax` may be `8B F8` or `89 C7`).
 
-- Scope thread-local overrides with RAII around the outer radar update.
-- Never change global demo state outside that scope.
-- Validate instruction shapes, offsets, module bounds, and hook targets before
-  enabling a hook.
-- If a required target cannot be resolved, leave Radar POV disabled and emit a
-  precise log reason. Do not guess an address.
-- Do not restore old manual marker/UI rendering unless native rendering is
-  demonstrably unavailable; it cannot reproduce the full first-person radar
-  contract reliably.
+## Implement rules
 
-## Validate the result
+- Scope all overrides with `g_inRadarUpdate` + `g_povActive`; clear after the outer update.
+- Never leave demo state forced false outside that scope.
+- Validate prologues / module bounds before `MH_CreateHook`; fail closed with logs.
+- Competitive colours: **teammates only** via `g_povSelfTeam` from **observed pawn**
+  `m_iTeamNum` (`+0x3E7`), not only `GetEntityBySlot` (often team `0` at setup).
+- `RadarPov_QueueEngineSetup` must stay empty unless product explicitly wants cvars.
+- Keep changes in `radar_pov.cpp` / `.h` unless the skill docs themselves need update.
 
-Build the plugin, then test a representative demo with radar rotation enabled.
-Inspect `csdm.log` for the resolved targets, installed hooks, scoped state
-transitions, and absence of exceptions. Verify the native visual contract in
-game, not only logs. Keep the change narrow and run the repository's relevant
-build/check commands before publishing.
+## Validate
+
+1. Build the Windows plugin.
+2. Play a competitive demo, `spec_mode` first-person, radar rotation on.
+3. Check `csdm.log` against **Healthy log** in `references/current-implementation.md`.
+4. Visual: allies multi-colour; enemies default (not competitive palette); no freecam dot.
 
 ## Keep this skill current
 
-After a confirmed game update, replace stale facts in
-`references/current-implementation.md`: client fingerprint, RVAs or extraction
-patterns, changed semantics, log evidence, and the visual result. Update this
-`SKILL.md` only when the reusable maintenance workflow itself improved. Keep
-unverified reverse-engineering hypotheses clearly marked as hypotheses.
+After a client update or confirmed design change, update
+`references/current-implementation.md` (fingerprint, anchors, hook list, logs,
+known pitfalls). Update this `SKILL.md` only when the **workflow** changes.
+Mark unverified RE notes as hypotheses.
