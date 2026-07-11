@@ -153,12 +153,15 @@ del *.pdb</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="cdll_interfaces.h" />
+    <ClInclude Include="cs2_cvar_access.h" />
+    <ClInclude Include="radar_pov.h" />
     <ClInclude Include="record_status_bridge.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="deps\easywsclient\easywsclient.cpp" />
     <ClCompile Include="deps\hl2sdk\tier1\convar.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="radar_pov.cpp" />
     <ClCompile Include="record_status_bridge.cpp" />
   </ItemGroup>
   <ItemGroup>

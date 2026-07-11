@@ -24,6 +24,7 @@ LIBS = -ldl -ltier0 -l:tier1.a
 
 SRC_FILES = main.cpp \
 			record_status_bridge.cpp \
+			radar_pov.cpp \
 			./deps/easywsclient/easywsclient.cpp \
 			./deps/hl2sdk/tier1/convar.cpp
 
