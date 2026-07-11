@@ -1,4 +1,5 @@
 #include "radar_pov.h"
+#include "mem_utils.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -12,9 +13,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
-#include <Psapi.h>
 #include <MinHook.h>
-#pragma comment(lib, "Psapi.lib")
+using namespace MemUtils;
 #endif
 
 namespace {
@@ -26,10 +26,13 @@ namespace {
 //   radar_update, getLocal, GetEntityBySlot, demo/HLTV, findPlayerBySlot,
 //   SetRadarIconType (teammate 0x11→9/0xD), RadarIconColor (force cl_teammate_color_*)
 // Colour-gate hooks (863200 / 8494d0) removed — force-color covers them.
+//
+// PE/pattern helpers live in mem_utils.h (MemUtils) for reuse by other features.
 // =============================================================================
 
 RadarPovLogFn g_log = nullptr;
-std::atomic<bool> g_enabled{true};
+// Default off — sequence JSON "csdm_radar_pov" enables once (see main.cpp).
+std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_installed{false};
 
 thread_local int g_inRadarUpdate = 0;
@@ -66,325 +69,6 @@ void Log(const char* fmt, ...)
 }
 
 #ifdef _WIN32
-
-struct ModuleInfo {
-    uint8_t* base = nullptr;
-    size_t size = 0;
-};
-
-bool GetModuleInfo(const char* name, ModuleInfo& out)
-{
-    HMODULE mod = GetModuleHandleA(name);
-    if (mod == nullptr) {
-        return false;
-    }
-    MODULEINFO info = {};
-    if (!GetModuleInformation(GetCurrentProcess(), mod, &info, sizeof(info))) {
-        return false;
-    }
-    out.base = reinterpret_cast<uint8_t*>(info.lpBaseOfDll);
-    out.size = static_cast<size_t>(info.SizeOfImage);
-    return out.base != nullptr && out.size > 0;
-}
-
-uint32_t GetPeTimestamp(const ModuleInfo& mod)
-{
-    if (mod.base == nullptr || mod.size < sizeof(IMAGE_DOS_HEADER)) {
-        return 0;
-    }
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod.base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
-        static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > mod.size) {
-        return 0;
-    }
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod.base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        return 0;
-    }
-    return nt->FileHeader.TimeDateStamp;
-}
-
-// ---------------------------------------------------------------------------
-// Pattern scan (AfxHookSource2-style hex strings with ?? wildcards)
-// e.g. "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 B0 02 00 00"
-// ---------------------------------------------------------------------------
-
-struct PatternByte {
-    uint8_t value = 0;
-    uint8_t mask = 0;  // 0xFF = compare, 0x00 = wildcard
-};
-
-bool ParseHexDigit(char c, uint8_t& out)
-{
-    if (c >= '0' && c <= '9') {
-        out = static_cast<uint8_t>(c - '0');
-        return true;
-    }
-    if (c >= 'a' && c <= 'f') {
-        out = static_cast<uint8_t>(c - 'a' + 10);
-        return true;
-    }
-    if (c >= 'A' && c <= 'F') {
-        out = static_cast<uint8_t>(c - 'A' + 10);
-        return true;
-    }
-    return false;
-}
-
-// Returns false if the pattern string is empty or malformed.
-bool ParsePattern(const char* hex, std::vector<PatternByte>& out)
-{
-    out.clear();
-    if (hex == nullptr) {
-        return false;
-    }
-    size_t i = 0;
-    while (hex[i] != '\0') {
-        while (hex[i] == ' ' || hex[i] == '\t') {
-            ++i;
-        }
-        if (hex[i] == '\0') {
-            break;
-        }
-        const char c0 = hex[i++];
-        char c1 = 0;
-        if (hex[i] != '\0' && hex[i] != ' ' && hex[i] != '\t') {
-            c1 = hex[i++];
-        } else {
-            // Single nibble is invalid unless '?'
-            if (c0 != '?') {
-                out.clear();
-                return false;
-            }
-            c1 = '?';
-        }
-        PatternByte pb = {};
-        if (c0 == '?' && (c1 == '?' || c1 == 0)) {
-            pb.value = 0;
-            pb.mask = 0;
-        } else {
-            uint8_t hi = 0;
-            uint8_t lo = 0;
-            if (c0 == '?') {
-                pb.mask = 0x0F;
-                if (!ParseHexDigit(c1, lo)) {
-                    out.clear();
-                    return false;
-                }
-                pb.value = lo;
-            } else if (c1 == '?') {
-                pb.mask = 0xF0;
-                if (!ParseHexDigit(c0, hi)) {
-                    out.clear();
-                    return false;
-                }
-                pb.value = static_cast<uint8_t>(hi << 4);
-            } else {
-                if (!ParseHexDigit(c0, hi) || !ParseHexDigit(c1, lo)) {
-                    out.clear();
-                    return false;
-                }
-                pb.value = static_cast<uint8_t>((hi << 4) | lo);
-                pb.mask = 0xFF;
-            }
-        }
-        out.push_back(pb);
-    }
-    return !out.empty();
-}
-
-bool MatchPatternAt(const uint8_t* p, const std::vector<PatternByte>& pat)
-{
-    if (p == nullptr || pat.empty()) {
-        return false;
-    }
-    for (size_t i = 0; i < pat.size(); ++i) {
-        if (pat[i].mask == 0) {
-            continue;
-        }
-        if ((p[i] & pat[i].mask) != (pat[i].value & pat[i].mask)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool MatchPattern(const uint8_t* p, size_t avail, const char* hex)
-{
-    std::vector<PatternByte> pat;
-    if (!ParsePattern(hex, pat) || avail < pat.size()) {
-        return false;
-    }
-    return MatchPatternAt(p, pat);
-}
-
-// First hit in [begin, begin+size). nullptr if none.
-const uint8_t* FindPattern(const uint8_t* begin, size_t size, const char* hex)
-{
-    std::vector<PatternByte> pat;
-    if (!ParsePattern(hex, pat) || begin == nullptr || size < pat.size()) {
-        return nullptr;
-    }
-    const size_t plen = pat.size();
-    const uint8_t* end = begin + size - plen;
-    for (const uint8_t* p = begin; p <= end; ++p) {
-        if (MatchPatternAt(p, pat)) {
-            return p;
-        }
-    }
-    return nullptr;
-}
-
-std::vector<const uint8_t*> FindPatternAll(const uint8_t* begin, size_t size, const char* hex,
-                                           size_t maxHits = 32)
-{
-    std::vector<const uint8_t*> hits;
-    std::vector<PatternByte> pat;
-    if (!ParsePattern(hex, pat) || begin == nullptr || size < pat.size()) {
-        return hits;
-    }
-    const size_t plen = pat.size();
-    const uint8_t* end = begin + size - plen;
-    for (const uint8_t* p = begin; p <= end && hits.size() < maxHits; ++p) {
-        if (MatchPatternAt(p, pat)) {
-            hits.push_back(p);
-        }
-    }
-    return hits;
-}
-
-const uint8_t* FindBytes(const uint8_t* begin, size_t size, const void* needle, size_t needleSize)
-{
-    if (begin == nullptr || needle == nullptr || needleSize == 0 || size < needleSize) {
-        return nullptr;
-    }
-    const uint8_t* n = static_cast<const uint8_t*>(needle);
-    const uint8_t* end = begin + size - needleSize;
-    for (const uint8_t* p = begin; p <= end; ++p) {
-        if (memcmp(p, n, needleSize) == 0) {
-            return p;
-        }
-    }
-    return nullptr;
-}
-
-const char* FindCString(const ModuleInfo& mod, const char* str)
-{
-    const size_t len = strlen(str) + 1;
-    return reinterpret_cast<const char*>(FindBytes(mod.base, mod.size, str, len));
-}
-
-bool DecodeLeaRip(const uint8_t* insn, uintptr_t insnAddr, uintptr_t& targetOut, size_t& sizeOut)
-{
-    if (insn == nullptr) {
-        return false;
-    }
-    if ((insn[0] != 0x48 && insn[0] != 0x4C) || insn[1] != 0x8D) {
-        return false;
-    }
-    const uint8_t modrm = insn[2];
-    if ((modrm & 0xC7) != 0x05) {
-        return false;
-    }
-    const int32_t rel = *reinterpret_cast<const int32_t*>(insn + 3);
-    targetOut = insnAddr + 7 + static_cast<intptr_t>(rel);
-    sizeOut = 7;
-    return true;
-}
-
-std::vector<uintptr_t> FindLeaRipXrefs(const ModuleInfo& mod, uintptr_t target)
-{
-    std::vector<uintptr_t> hits;
-    if (mod.base == nullptr || mod.size < 7) {
-        return hits;
-    }
-    for (size_t i = 0; i + 7 <= mod.size; ++i) {
-        uintptr_t resolved = 0;
-        size_t sz = 0;
-        const uintptr_t addr = reinterpret_cast<uintptr_t>(mod.base + i);
-        if (DecodeLeaRip(mod.base + i, addr, resolved, sz) && resolved == target) {
-            hits.push_back(addr);
-        }
-    }
-    return hits;
-}
-
-bool LooksLikePrologue(const uint8_t* p)
-{
-    if (p == nullptr) {
-        return false;
-    }
-    if (p[0] == 0x40 && (p[1] == 0x53 || p[1] == 0x55 || p[1] == 0x56 || p[1] == 0x57)) {
-        return true;
-    }
-    if (p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC) {
-        return true;
-    }
-    if (p[0] == 0x48 && p[1] == 0x89 && (p[2] & 0xC7) == 0x44) {
-        return true;
-    }
-    if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0xC4) {
-        return true;
-    }
-    if (p[0] == 0x55 || p[0] == 0x53 || p[0] == 0x56 || p[0] == 0x57) {
-        return true;
-    }
-    if (p[0] == 0x41 && (p[1] >= 0x54 && p[1] <= 0x57)) {
-        return true;
-    }
-    // Radar update wrapper: test dl,dl
-    if (p[0] == 0x84 && p[1] == 0xD2) {
-        return true;
-    }
-    return false;
-}
-
-uintptr_t FindFunctionStart(const ModuleInfo& mod, uintptr_t anywhereInFn)
-{
-    if (mod.base == nullptr || anywhereInFn < reinterpret_cast<uintptr_t>(mod.base)) {
-        return 0;
-    }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
-    const uintptr_t minAddr = anywhereInFn > base + 0x2000 ? anywhereInFn - 0x2000 : base;
-    for (uintptr_t p = anywhereInFn; p > minAddr; --p) {
-        const uint8_t prev = *reinterpret_cast<const uint8_t*>(p - 1);
-        if ((prev == 0xCC || prev == 0x90 || prev == 0xC3 || prev == 0xC2) &&
-            LooksLikePrologue(reinterpret_cast<const uint8_t*>(p))) {
-            return p;
-        }
-    }
-    return anywhereInFn & ~static_cast<uintptr_t>(0xF);
-}
-
-bool DecodeRel32Call(const uint8_t* insn, uintptr_t insnAddr, uintptr_t& targetOut)
-{
-    if (insn == nullptr || insn[0] != 0xE8) {
-        return false;
-    }
-    const int32_t rel = *reinterpret_cast<const int32_t*>(insn + 1);
-    targetOut = insnAddr + 5 + static_cast<intptr_t>(rel);
-    return true;
-}
-
-std::vector<uintptr_t> CollectDirectCalls(uintptr_t fn, size_t maxScan = 0x800)
-{
-    std::vector<uintptr_t> calls;
-    if (fn == 0) {
-        return calls;
-    }
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-    for (size_t i = 0; i + 5 < maxScan; ++i) {
-        if (p[i] == 0xCC && p[i + 1] == 0xCC && i > 0x40) {
-            break;
-        }
-        uintptr_t target = 0;
-        if (DecodeRel32Call(p + i, fn + i, target)) {
-            calls.push_back(target);
-            i += 4;
-        }
-    }
-    return calls;
-}
 
 // ---------------------------------------------------------------------------
 // Types — only identity / demo / scope
@@ -971,66 +655,6 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
-
-bool IsInsideModule(const ModuleInfo& mod, uintptr_t addr)
-{
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
-    return addr >= base && addr < base + mod.size;
-}
-
-bool IsLikelyDataObject(const ModuleInfo& mod, uintptr_t addr)
-{
-    if (!IsInsideModule(mod, addr)) {
-        return false;
-    }
-    const auto* s = reinterpret_cast<const char*>(addr);
-    int printable = 0;
-    for (int i = 0; i < 16; ++i) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        if (c == 0) {
-            break;
-        }
-        if (c >= 32 && c < 127) {
-            ++printable;
-        } else {
-            return true;
-        }
-    }
-    return printable < 8;
-}
-
-size_t ApproxFnSize(uintptr_t fn)
-{
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-    for (size_t i = 0x20; i < 0x2000; ++i) {
-        if (p[i] == 0xCC && p[i + 1] == 0xCC) {
-            return i;
-        }
-    }
-    return 0x100;
-}
-
-std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
-{
-    std::vector<uintptr_t> sites;
-    if (mod.base == nullptr || fn == 0) {
-        return sites;
-    }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
-    for (size_t i = 0; i + 5 < mod.size; ++i) {
-        if (mod.base[i] != 0xE8) {
-            continue;
-        }
-        uintptr_t target = 0;
-        if (!DecodeRel32Call(mod.base + i, base + i, target)) {
-            continue;
-        }
-        if (target == fn) {
-            sites.push_back(base + i);
-        }
-    }
-    return sites;
-}
 
 bool ResolveRadarFunctions(const ModuleInfo& client)
 {

@@ -155,6 +155,7 @@ del *.pdb</Command>
     <ClInclude Include="cdll_interfaces.h" />
     <ClInclude Include="cs2_cvar_access.h" />
     <ClInclude Include="deps\minhook\include\MinHook.h" />
+    <ClInclude Include="mem_utils.h" />
     <ClInclude Include="radar_pov.h" />
     <ClInclude Include="record_status_bridge.h" />
   </ItemGroup>
@@ -166,6 +167,7 @@ del *.pdb</Command>
     <ClCompile Include="deps\minhook\src\trampoline.c" />
     <ClCompile Include="deps\minhook\src\hde\hde64.c" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="mem_utils.cpp" />
     <ClCompile Include="radar_pov.cpp" />
     <ClCompile Include="record_status_bridge.cpp" />
   </ItemGroup>

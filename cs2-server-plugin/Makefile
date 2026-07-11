@@ -23,6 +23,7 @@ LIB_DIRS = -L./deps/hl2sdk/lib/linux64
 LIBS = -ldl -ltier0 -l:tier1.a
 
 SRC_FILES = main.cpp \
+			mem_utils.cpp \
 			record_status_bridge.cpp \
 			radar_pov.cpp \
 			./deps/easywsclient/easywsclient.cpp \

@@ -21,6 +21,9 @@
     <ClInclude Include="cs2_cvar_access.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="mem_utils.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="radar_pov.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -33,6 +36,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mem_utils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="deps\easywsclient\easywsclient.cpp">

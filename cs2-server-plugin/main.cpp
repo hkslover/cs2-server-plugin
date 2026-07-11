@@ -235,6 +235,59 @@ static void QueueEngineCommandCStr(const char* cmd) {
     }
 }
 
+// Sequence JSON special action (same path as pause_playback / go_to_next_sequence).
+// Accepts: "csdm_radar_pov" or "csdm_radar_pov 1". Idempotent: never re-installs hooks.
+// Returns true if cmd was handled here (do not send to engine).
+static bool TryHandleRadarPovSequenceCmd(const string& cmd)
+{
+    static const char kRadarPovCmd[] = "csdm_radar_pov";
+    static const char kRadarPovCmdPref[] = "csdm_radar_pov ";  // includes trailing space
+    if (cmd != kRadarPovCmd && cmd.rfind(kRadarPovCmdPref, 0) != 0) {
+        return false;
+    }
+
+    // Optional arg: only 0 / false / off disable; anything else (or bare cmd) enables.
+    bool wantEnable = true;
+    if (cmd.rfind(kRadarPovCmdPref, 0) == 0) {
+        const string arg = cmd.substr(sizeof(kRadarPovCmdPref) - 1);
+        if (arg == "0" || arg == "false" || arg == "off" || arg == "no") {
+            wantEnable = false;
+        }
+    }
+
+    if (!wantEnable) {
+        if (!RadarPov_IsEnabled()) {
+            Log("Radar POV: already disabled, ignoring JSON command");
+            return true;
+        }
+        RadarPov_SetEnabled(false);
+        Log("Radar POV: disabled via JSON (hooks left installed; set csdm_radar_pov to re-enable)");
+        return true;
+    }
+
+    if (RadarPov_IsInstalled() && RadarPov_IsEnabled()) {
+        Log("Radar POV: already active, ignoring duplicate JSON command");
+        return true;
+    }
+
+    RadarPov_SetLogger(&Log);
+    RadarPov_SetEnabled(true);
+
+    if (RadarPov_IsInstalled()) {
+        Log("Radar POV: hooks already installed, re-enabled via JSON");
+        return true;
+    }
+
+    if (RadarPov_Install()) {
+        RadarPov_QueueEngineSetup(&QueueEngineCommandCStr);
+        Log("Radar POV ready from JSON (installed=%d enabled=%d)",
+            RadarPov_IsInstalled() ? 1 : 0, RadarPov_IsEnabled() ? 1 : 0);
+    } else {
+        Log("Radar POV: install failed from JSON command");
+    }
+    return true;
+}
+
 ISource2EngineToClient* GetEngine()
 {
     if (engineToClient != NULL) {
@@ -445,6 +498,9 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
                     currentTick = -1;
                     break;
                 }
+                else if (TryHandleRadarPovSequenceCmd(action.cmd)) {
+                    Log("[%d] Handled sequence cmd: %s", newTick, action.cmd.c_str());
+                }
                 else {
                     Log("[%d] Executing: %s", newTick, action.cmd.c_str());
                     engine->ExecuteClientCmd(0, action.cmd.c_str(), true);
@@ -651,16 +707,11 @@ void NewClientFullyConnect(void* thisptr, int playerSlot)
         Log("Hooked FrameStageNotify");
     }
 
-    // First-person radar simulation (default on). Non-fatal if signatures miss.
+    // Radar POV is opt-in via sequence JSON action "csdm_radar_pov" (idempotent).
+    // Not installed here — avoids default-on and keeps config with other demo actions.
     RadarPov_SetLogger(&Log);
-    RadarPov_SetEnabled(true);
-    if (RadarPov_Install()) {
-        RadarPov_QueueEngineSetup(&QueueEngineCommandCStr);
-        Log("Radar POV ready (installed=%d enabled=%d)", RadarPov_IsInstalled() ? 1 : 0, RadarPov_IsEnabled() ? 1 : 0);
-    } else {
-        Log("Radar POV install failed; using engine default demo radar");
-    }
-    
+    RadarPov_SetEnabled(false);
+
     // Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
     // We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
     QueueEngineCommand("demo_ui_mode 0");
@@ -730,37 +781,11 @@ EXPORT void* CreateInterface(const char* pName, int* pReturnCode)
 }
 
 #ifdef CON_COMMAND_ENABLED
-CON_COMMAND(csdm_radar_pov, "Radar POV (true first-person while spectating): csdm_radar_pov 0|1")
-{
-    if (args.ArgC() < 2) {
-        Log("csdm_radar_pov = %d installed=%d. Usage: csdm_radar_pov 0|1  (true POV = getLocal->observed pawn)",
-            RadarPov_IsEnabled() ? 1 : 0,
-            RadarPov_IsInstalled() ? 1 : 0);
-        return;
-    }
-    const bool enabled = atoi(args.Arg(1)) != 0;
-    RadarPov_SetEnabled(enabled);
-    if (enabled) {
-        if (RadarPov_IsInstalled()) {
-            RadarPov_Uninstall();
-        }
-        RadarPov_SetLogger(&Log);
-        if (!RadarPov_Install()) {
-            Log("csdm_radar_pov: install failed");
-            return;
-        }
-        RadarPov_QueueEngineSetup(&QueueEngineCommandCStr);
-    } else if (RadarPov_IsInstalled()) {
-        RadarPov_Uninstall();
-    }
-    Log("csdm_radar_pov set to %d installed=%d", enabled ? 1 : 0, RadarPov_IsInstalled() ? 1 : 0);
-}
-
 CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
 {
     Log("Tick: %d", currentTick.load());
     Log("Is playing demo: %d", isPlayingDemo);
-    Log("Radar POV: enabled=%d installed=%d (getLocal->observed pawn)",
+    Log("Radar POV: enabled=%d installed=%d (JSON cmd: csdm_radar_pov)",
         RadarPov_IsEnabled() ? 1 : 0,
         RadarPov_IsInstalled() ? 1 : 0);
 

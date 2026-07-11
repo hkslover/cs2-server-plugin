@@ -14,6 +14,8 @@ using RadarPovLogFn = void (*)(const char* fmt, ...);
 
 void RadarPov_SetLogger(RadarPovLogFn logger);
 
+// Runtime gate for hooks. Enabled from sequence JSON action "csdm_radar_pov"
+// (main.cpp); install is idempotent — duplicate JSON actions are ignored.
 void RadarPov_SetEnabled(bool enabled);
 bool RadarPov_IsEnabled();
 
