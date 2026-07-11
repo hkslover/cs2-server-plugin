@@ -46,6 +46,8 @@ thread_local void* g_povSelfPawn = nullptr;
 thread_local bool g_povActive = false;
 thread_local int g_spectatorSlot = -1;
 thread_local int g_povSelfSlot = -1;
+// Observed player's m_iTeamNum (2=CT, 3=T). Competitive colours are teammates only.
+thread_local int g_povSelfTeam = 0;
 
 std::atomic<int> g_faultRadarUpdate{0};
 std::atomic<int> g_faultGetLocal{0};
@@ -482,12 +484,35 @@ void* __fastcall Hook_GetEntityBySlot(int slot)
     return g_origGetEntityBySlot(slot);
 }
 
+int ReadControllerTeam(void* controller)
+{
+    if (controller == nullptr) {
+        return 0;
+    }
+    __try {
+        return static_cast<unsigned char>(
+            *(reinterpret_cast<uint8_t*>(controller) + kControllerTeamOffset));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// True only for same T/CT as the observed player (never spectators / enemies).
+bool IsPovTeammateTeam(int playerTeam)
+{
+    if (g_povSelfTeam != kTeamT && g_povSelfTeam != kTeamCT) {
+        return false;
+    }
+    return playerTeam == g_povSelfTeam;
+}
+
 void PreparePovContext()
 {
     g_povSelfPawn = nullptr;
     g_povActive = false;
     g_spectatorSlot = -1;
     g_povSelfSlot = -1;
+    g_povSelfTeam = 0;
 
     if (g_origGetLocal == nullptr || g_getObserverTarget == nullptr) {
         return;
@@ -526,9 +551,20 @@ void PreparePovContext()
             g_povSelfSlot = povSlot;
         }
     }
+    // Team for teammate-only competitive colours (controller array by slot).
+    if (g_origGetEntityBySlot != nullptr && g_povSelfSlot >= 0) {
+        void* ctrl = nullptr;
+        __try {
+            // Call original: slot is already the observed player, not 0/-1 remap.
+            ctrl = g_origGetEntityBySlot(g_povSelfSlot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ctrl = nullptr;
+        }
+        g_povSelfTeam = ReadControllerTeam(ctrl);
+    }
     if (g_logPovOk.fetch_add(1) == 0) {
-        Log("Radar POV: active — pawn %p -> observed %p (slot %d, spectatorSlot %d)", realPawn,
-            povPawn, g_povSelfSlot, g_spectatorSlot);
+        Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)",
+            realPawn, povPawn, g_povSelfSlot, g_povSelfTeam, g_spectatorSlot);
     }
 }
 
@@ -538,6 +574,7 @@ void ClearPovContext()
     g_povActive = false;
     g_spectatorSlot = -1;
     g_povSelfSlot = -1;
+    g_povSelfTeam = 0;
 }
 
 void __fastcall Hook_RadarUpdate(void* updateContext, uint8_t updateEnabled)
@@ -600,14 +637,14 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
 
 // FUN_180e39320: with live identity, same-team non-self icons become type 0x11.
 // FUN_180e460e0 live RGB only paints types 9 / 0xD. Map 0x11 → team panel type
-// so the engine's own cl_teammate_color paint runs (no manual SetColor).
+// for POV teammates only (never rewrite enemy icons).
 void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
 {
     if (g_origSetRadarIconType != nullptr) {
         g_origSetRadarIconType(icon, playerTeam);
     }
     if (!g_enabled.load(std::memory_order_relaxed) || g_inRadarUpdate <= 0 || !g_povActive ||
-        icon == nullptr) {
+        icon == nullptr || !IsPovTeammateTeam(playerTeam)) {
         return;
     }
     __try {
@@ -616,29 +653,22 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
         if (*typePtr != kIconTypeLiveTeammate) {
             return;
         }
-        int fixed = 0;
-        if (playerTeam == kTeamT) {
-            fixed = kIconTypeT;
-        } else if (playerTeam == kTeamCT) {
-            fixed = kIconTypeCT;
-        } else {
-            return;
-        }
+        const int fixed = (playerTeam == kTeamT) ? kIconTypeT : kIconTypeCT;
         *typePtr = fixed;
         if (g_logIconType.fetch_add(1) == 0) {
-            Log("Radar POV: icon type 0x11 -> %d (team %d) for native competitive RGB", fixed,
-                playerTeam);
+            Log("Radar POV: icon type 0x11 -> %d (teammate team %d, self team %d)", fixed,
+                playerTeam, g_povSelfTeam);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // ignore
     }
 }
 
-// FUN_180863200: open competitive-colour gate for T/CT during POV.
+// FUN_180863200: open competitive-colour gate only for observed player's team.
 uint8_t __fastcall Hook_ShouldApplyCompColor(int localTeam, int iconTeam)
 {
     if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
-        (iconTeam == kTeamT || iconTeam == kTeamCT)) {
+        IsPovTeammateTeam(iconTeam)) {
         return 1;
     }
     return g_origShouldApplyCompColor != nullptr ? g_origShouldApplyCompColor(localTeam, iconTeam)
@@ -741,22 +771,10 @@ void ForceCompetitiveIconColor(void* icon)
             return;
         }
 
-        const int playerTeam = static_cast<unsigned char>(
-            *(reinterpret_cast<uint8_t*>(controller) + kControllerTeamOffset));
-        if (playerTeam != kTeamT && playerTeam != kTeamCT) {
+        const int playerTeam = ReadControllerTeam(controller);
+        // Competitive palette is teammates only; enemies stay native red/default.
+        if (!IsPovTeammateTeam(playerTeam)) {
             return;
-        }
-
-        // Enemies keep native red/team treatment.
-        if (g_origGetEntityBySlot != nullptr && g_povSelfSlot >= 0) {
-            void* localCtrl = g_origGetEntityBySlot(g_povSelfSlot);
-            if (localCtrl != nullptr) {
-                const int localTeam = static_cast<unsigned char>(
-                    *(reinterpret_cast<uint8_t*>(localCtrl) + kControllerTeamOffset));
-                if ((localTeam == kTeamT || localTeam == kTeamCT) && playerTeam != localTeam) {
-                    return;
-                }
-            }
         }
 
         int colorIdx = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(controller) +
@@ -785,9 +803,9 @@ void ForceCompetitiveIconColor(void* icon)
 
         const int n = g_logForceColor.fetch_add(1);
         if (n == 0 || n == 10 || n == 50) {
-            Log("Radar POV: force-color type=%d team=%d netvar=%d idx=%d argb=0x%08X panels=%d "
-                "playerIndex=%d",
-                type, playerTeam, rawNetvar, colorIdx, argb, painted, playerIndex);
+            Log("Radar POV: force-color teammate type=%d team=%d selfTeam=%d netvar=%d idx=%d "
+                "argb=0x%08X panels=%d playerIndex=%d",
+                type, playerTeam, g_povSelfTeam, rawNetvar, colorIdx, argb, painted, playerIndex);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (g_logForceColorSkip.fetch_add(1) == 0) {
