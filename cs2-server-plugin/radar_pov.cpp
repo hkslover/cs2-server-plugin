@@ -42,6 +42,8 @@ std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
 std::atomic<int> g_logPovFail{0};
 std::atomic<int> g_logSpectatorFilter{0};
+std::atomic<int> g_logPresentationOverride{0};
+std::atomic<int> g_logDemoStateOverride{0};
 
 void Log(const char* fmt, ...)
 {
@@ -221,6 +223,10 @@ std::vector<uintptr_t> CollectDirectCalls(uintptr_t fn, size_t maxScan = 0x800)
 // ---------------------------------------------------------------------------
 
 using RadarUpdateFn = void(__fastcall*)(void* updateContext, uint8_t updateEnabled);
+// Selects the radar's live-POV (1) versus spectator (0) Panorama panel set.
+using RadarPresentationFn = void(__fastcall*)(void* radar, uint8_t localPov, uint8_t force);
+// Engine-side demo / HLTV state queried by radar_mode and player icon classes.
+using RadarDemoStateFn = uint8_t(__fastcall*)(void* engineState);
 using GetLocalFn = void*(__fastcall*)();
 // getObs(localPawn) — first insn is mov rcx,[rcx+0x1220] (observer services on pawn).
 using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
@@ -231,6 +237,8 @@ using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
 using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
+RadarPresentationFn g_origRadarPresentation = nullptr;
+RadarDemoStateFn g_origRadarDemoState = nullptr;
 GetLocalFn g_origGetLocal = nullptr;
 GetObserverTargetFn g_getObserverTarget = nullptr;
 GetPlayerSlotFn g_getPlayerSlot = nullptr;
@@ -238,6 +246,7 @@ FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 
 bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
+uintptr_t g_radarDemoStateGlobalSlot = 0;
 
 // getLocal validates return with vtable+0x4D8 = IsPlayerPawn (index 155).
 constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
@@ -500,6 +509,40 @@ void __fastcall Hook_RadarUpdate(void* updateContext, uint8_t updateEnabled)
     }
 }
 
+// radar_mode combines getLocal with independent demo / HLTV conditions before
+// it reaches this selector. Those conditions otherwise keep the spectator
+// Panorama panels active even when getLocal has been redirected. The live-POV
+// panel set is the engine's native rotating, local-player presentation.
+void __fastcall Hook_RadarPresentation(void* radar, uint8_t localPov, uint8_t force)
+{
+    if (g_inRadarUpdate > 0 && g_povActive) {
+        if (g_logPresentationOverride.fetch_add(1) == 0) {
+            Log("Radar POV: native live-POV radar presentation selector %u -> 1",
+                static_cast<unsigned>(localPov));
+        }
+        localPov = 1;
+    }
+    if (g_origRadarPresentation != nullptr) {
+        g_origRadarPresentation(radar, localPov, force);
+    }
+}
+
+uint8_t __fastcall Hook_RadarDemoState(void* engineState)
+{
+    uint8_t result = 0;
+    if (g_origRadarDemoState != nullptr) {
+        result = g_origRadarDemoState(engineState);
+    }
+    if (g_inRadarUpdate > 0 && g_povActive) {
+        if (g_logDemoStateOverride.fetch_add(1) == 0) {
+            Log("Radar POV: native demo/HLTV state %u -> 0 for radar frame",
+                static_cast<unsigned>(result));
+        }
+        return 0;
+    }
+    return result;
+}
+
 // Make the demo-only spectator slot look absent to the radar's normal player
 // enumeration. This preserves the engine's own spotted and color paths for
 // every actual player, rather than trying to synthesize an icon state.
@@ -581,6 +624,7 @@ std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
 
 bool ResolveRadarFunctions(const ModuleInfo& client)
 {
+    g_radarDemoStateGlobalSlot = 0;
     const char* cvarName = FindCString(client, "cl_radar_show_all_players_when_spectating");
     if (cvarName == nullptr) {
         Log("Radar POV: cvar name string not found in client.dll");
@@ -679,6 +723,53 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     }
     Log("Radar POV: full radar update fn @ %p size=0x%zx", reinterpret_cast<void*>(radarUpdateFn),
         ApproxFnSize(radarUpdateFn));
+
+    // The final mode call selects the panel set. Verify the callee's current
+    // prologue and its radar+0x60 state byte before hooking it.
+    uintptr_t radarPresentationFn = 0;
+    const auto modeCalls = CollectDirectCalls(radarModeFn, ApproxFnSize(radarModeFn));
+    for (uintptr_t candidate : modeCalls) {
+        if (!IsInsideModule(client, candidate)) {
+            continue;
+        }
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(candidate);
+        if (b[0] == 0x40 && b[1] == 0x53 && b[2] == 0x48 && b[3] == 0x83 && b[4] == 0xEC &&
+            b[5] == 0x20 && b[6] == 0x83 && b[7] == 0xB9 && b[8] == 0x70 && b[9] == 0x01 &&
+            b[10] == 0x00 && b[11] == 0x00 && b[12] == 0xFF) {
+            radarPresentationFn = candidate;
+            break;
+        }
+    }
+    if (radarPresentationFn == 0) {
+        Log("Radar POV: native radar presentation selector not found");
+        return false;
+    }
+    Log("Radar POV: native radar presentation selector @ %p", reinterpret_cast<void*>(radarPresentationFn));
+
+    // radar_mode and per-player class selection both call the same engine
+    // demo/HLTV virtual predicate: mov rcx,[rip+global]; mov rax,[rcx];
+    // call [rax+2B0h]. It must be false inside a simulated live-POV radar
+    // frame or native rendering keeps the spectator color classes.
+    for (size_t i = 0; i + 15 < ApproxFnSize(radarModeFn); ++i) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(radarModeFn + i);
+        if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 ||
+            b[8] != 0x8B || b[9] != 0x01 || b[10] != 0xFF || b[11] != 0x90 ||
+            b[12] != 0xB0 || b[13] != 0x02 || b[14] != 0x00 || b[15] != 0x00) {
+            continue;
+        }
+        const int32_t rel = *reinterpret_cast<const int32_t*>(b + 3);
+        const uintptr_t slot = radarModeFn + i + 7 + static_cast<intptr_t>(rel);
+        if (IsInsideModule(client, slot)) {
+            g_radarDemoStateGlobalSlot = slot;
+            break;
+        }
+    }
+    if (g_radarDemoStateGlobalSlot == 0) {
+        Log("Radar POV: native demo/HLTV state predicate not found");
+        return false;
+    }
+    Log("Radar POV: native demo/HLTV state global @ %p",
+        reinterpret_cast<void*>(g_radarDemoStateGlobalSlot));
 
     uintptr_t radarPlayersFn = 0;
     {
@@ -831,6 +922,7 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     }
 
     g_origRadarUpdate = reinterpret_cast<RadarUpdateFn>(radarUpdateFn);
+    g_origRadarPresentation = reinterpret_cast<RadarPresentationFn>(radarPresentationFn);
     g_origGetLocal = getLocalFn != 0 ? reinterpret_cast<GetLocalFn>(getLocalFn) : nullptr;
     g_getObserverTarget = getObsFn != 0 ? reinterpret_cast<GetObserverTargetFn>(getObsFn) : nullptr;
     g_getPlayerSlot =
@@ -862,6 +954,8 @@ bool InstallHooks()
     g_minhookInitialized = true;
 
     void* updateTarget = reinterpret_cast<void*>(g_origRadarUpdate);
+    void* presentationTarget = reinterpret_cast<void*>(g_origRadarPresentation);
+    void* demoStateTarget = nullptr;
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
     void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
 
@@ -891,6 +985,32 @@ bool InstallHooks()
         return false;
     }
 
+    if (!CreateAndEnableHook(presentationTarget, reinterpret_cast<void*>(&Hook_RadarPresentation),
+                             reinterpret_cast<void**>(&g_origRadarPresentation),
+                             "radar_presentation")) {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        g_minhookInitialized = false;
+        g_origRadarUpdate = nullptr;
+        return false;
+    }
+
+    __try {
+        void* engineState = *reinterpret_cast<void**>(g_radarDemoStateGlobalSlot);
+        void** vtable = engineState != nullptr ? *reinterpret_cast<void***>(engineState) : nullptr;
+        demoStateTarget = vtable != nullptr ? vtable[0x2B0 / sizeof(void*)] : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        demoStateTarget = nullptr;
+    }
+    if (!CreateAndEnableHook(demoStateTarget, reinterpret_cast<void*>(&Hook_RadarDemoState),
+                             reinterpret_cast<void**>(&g_origRadarDemoState), "radar_demo_state")) {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        g_minhookInitialized = false;
+        g_origRadarUpdate = nullptr;
+        return false;
+    }
+
     if (findPlayerBySlotTarget != nullptr && g_getPlayerSlot != nullptr) {
         if (!CreateAndEnableHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
                                  reinterpret_cast<void**>(&g_origFindPlayerBySlot),
@@ -905,10 +1025,12 @@ bool InstallHooks()
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d radarUpdate=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origRadarUpdate != nullptr ? 1 : 0,
+        g_origRadarPresentation != nullptr ? 1 : 0,
+        g_origRadarDemoState != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0,
         g_getObserverTarget != nullptr ? 1 : 0,
         g_spectatorFilterHooked ? 1 : 0);
@@ -923,11 +1045,14 @@ void UninstallHooks()
         g_minhookInitialized = false;
     }
     g_origRadarUpdate = nullptr;
+    g_origRadarPresentation = nullptr;
+    g_origRadarDemoState = nullptr;
     g_origGetLocal = nullptr;
     g_getObserverTarget = nullptr;
     g_getPlayerSlot = nullptr;
     g_origFindPlayerBySlot = nullptr;
     g_spectatorFilterHooked = false;
+    g_radarDemoStateGlobalSlot = 0;
     g_installed.store(false, std::memory_order_release);
     Log("Radar POV: MinHook hooks removed");
 }
