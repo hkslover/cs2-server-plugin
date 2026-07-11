@@ -489,8 +489,72 @@ int* __fastcall Hook_GetPlayerSlot(void* player, int* outSlot)
 // Signature resolution from the Ghidra-mapped call chain
 // ---------------------------------------------------------------------------
 
-// Find ConVar registration LEA of the cvar name, then find the sole code
-// reader of the ConVar storage (FUN_180e1f000), its caller (main radar tick),
+// Helpers for PE-ish address classification inside client.dll.
+bool IsInsideModule(const ModuleInfo& mod, uintptr_t addr)
+{
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
+    return addr >= base && addr < base + mod.size;
+}
+
+// True if addr does not look like a C string (ConVar objects live in .data).
+bool IsLikelyDataObject(const ModuleInfo& mod, uintptr_t addr)
+{
+    if (!IsInsideModule(mod, addr)) {
+        return false;
+    }
+    const auto* s = reinterpret_cast<const char*>(addr);
+    int printable = 0;
+    for (int i = 0; i < 16; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0) {
+            break;
+        }
+        if (c >= 32 && c < 127) {
+            ++printable;
+        } else {
+            return true; // binary payload
+        }
+    }
+    // Long printable runs are strings in .rdata, not ConVar objects.
+    return printable < 8;
+}
+
+size_t ApproxFnSize(uintptr_t fn)
+{
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+    for (size_t i = 0x20; i < 0x800; ++i) {
+        if (p[i] == 0xCC && p[i + 1] == 0xCC) {
+            return i;
+        }
+    }
+    return 0x100;
+}
+
+// Return absolute addresses of E8 call sites that target `fn`.
+std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
+{
+    std::vector<uintptr_t> sites;
+    if (mod.base == nullptr || fn == 0) {
+        return sites;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
+    for (size_t i = 0; i + 5 < mod.size; ++i) {
+        if (mod.base[i] != 0xE8) {
+            continue;
+        }
+        uintptr_t target = 0;
+        if (!DecodeRel32Call(mod.base + i, base + i, target)) {
+            continue;
+        }
+        if (target == fn) {
+            sites.push_back(base + i);
+        }
+    }
+    return sites;
+}
+
+// Find ConVar registration LEA of the cvar name, then the mode reader of that
+// ConVar (must have E8 callers — excludes atexit), its caller (radar tick),
 // then the player-update call (FUN_180e328a0).
 bool ResolveRadarFunctions(const ModuleInfo& client)
 {
@@ -506,112 +570,83 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         Log("Radar POV: no LEA xrefs to cvar name");
         return false;
     }
+    Log("Radar POV: cvar name LEA xrefs=%zu (first @ %p)", nameXrefs.size(),
+        reinterpret_cast<void*>(nameXrefs[0]));
 
-    // Registration function: contains LEA of the name. Nearby should also LEA
-    // the help text; ConVar object is the first arg (usually via LEA rcx, [rip]).
-    uintptr_t regFn = FindFunctionStart(client, nameXrefs[0]);
-    if (regFn == 0) {
-        Log("Radar POV: failed to find cvar registration function");
-        return false;
-    }
-    Log("Radar POV: cvar registration fn @ %p", reinterpret_cast<void*>(regFn));
-
-    // Inside registration, collect LEA targets in .data that look like ConVar
-    // objects (first LEA rcx target that is inside the module data, not the string).
+    // Mega registration functions register many cvars. The ConVar object LEA
+    // sits immediately next to the name-string LEA (typically within ±0x80),
+    // not at the start of the whole registration blob.
     uintptr_t convarObj = 0;
-    {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(regFn);
-        for (size_t i = 0; i + 7 < 0x200; ++i) {
+    uintptr_t regFn = 0;
+    for (uintptr_t nameLea : nameXrefs) {
+        regFn = FindFunctionStart(client, nameLea);
+        // Prefer LEA targets in a window just before/after the name LEA.
+        // Correct ConVar is usually loaded once slightly before the name ptr.
+        uintptr_t best = 0;
+        intptr_t bestDist = 0x7fffffff;
+        for (int delta = -0x80; delta <= 0x40; ++delta) {
+            if (delta == 0) {
+                continue;
+            }
+            const uintptr_t at = nameLea + static_cast<intptr_t>(delta);
+            if (!IsInsideModule(client, at)) {
+                continue;
+            }
             uintptr_t target = 0;
             size_t sz = 0;
-            if (!DecodeLeaRip(p + i, regFn + i, target, sz)) {
+            if (!DecodeLeaRip(reinterpret_cast<const uint8_t*>(at), at, target, sz)) {
                 continue;
             }
             if (target == reinterpret_cast<uintptr_t>(cvarName)) {
                 continue;
             }
-            // Prefer first non-string LEA in the function body as ConVar thisptr.
-            if (target >= reinterpret_cast<uintptr_t>(client.base) &&
-                target < reinterpret_cast<uintptr_t>(client.base) + client.size) {
-                // Skip if it points into a C-string (printable).
-                const auto* s = reinterpret_cast<const char*>(target);
-                if (s[0] != 'c' && s[0] != 'S' && s[0] != 'I') {
-                    convarObj = target;
-                    break;
-                }
-                // "cl_radar..." already skipped; help text starts with 'S'
-                if (strncmp(s, "Set all players", 15) == 0) {
-                    continue;
-                }
-                if (strncmp(s, "cl_", 3) != 0) {
-                    convarObj = target;
-                    break;
-                }
+            if (!IsLikelyDataObject(client, target)) {
+                continue;
             }
+            // Prefer LEAs before the name (negative delta) and closest.
+            const intptr_t dist = delta < 0 ? -delta : (delta + 0x1000);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = target;
+            }
+        }
+        if (best != 0) {
+            convarObj = best;
+            break;
         }
     }
     if (convarObj == 0) {
-        Log("Radar POV: ConVar object not resolved from registration");
+        Log("Radar POV: ConVar object not resolved near cvar name LEA");
         return false;
     }
-    Log("Radar POV: ConVar object @ %p", reinterpret_cast<void*>(convarObj));
+    Log("Radar POV: ConVar object @ %p (reg fn @ %p)", reinterpret_cast<void*>(convarObj),
+        reinterpret_cast<void*>(regFn));
 
-    // Readers of the ConVar object (DATA xrefs via LEA). Prefer the largest
-    // non-registration function — that is the mode setup path, not atexit.
+    // Readers of the ConVar: registration, mode setup, atexit destructor.
+    // Mode is the non-reg function that has E8 call sites (atexit has none).
     const auto convarXrefs = FindLeaRipXrefs(client, convarObj);
     uintptr_t radarModeFn = 0;
-    size_t bestModeSize = 0;
-    auto approxSize = [](uintptr_t fn) -> size_t {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-        for (size_t i = 0x20; i < 0x800; ++i) {
-            if (p[i] == 0xCC && p[i + 1] == 0xCC) {
-                return i;
-            }
-        }
-        return 0x100;
-    };
+    uintptr_t radarTickFn = 0;
     for (uintptr_t xref : convarXrefs) {
         uintptr_t fn = FindFunctionStart(client, xref);
         if (fn == 0 || fn == regFn) {
             continue;
         }
-        const size_t sz = approxSize(fn);
-        if (sz > bestModeSize) {
-            bestModeSize = sz;
-            radarModeFn = fn;
+        const auto callSites = FindE8CallSites(client, fn);
+        if (callSites.empty()) {
+            // atexit / data-only references
+            Log("Radar POV: skip ConVar reader @ %p (no E8 callers, size 0x%zx)",
+                reinterpret_cast<void*>(fn), ApproxFnSize(fn));
+            continue;
         }
+        radarModeFn = fn;
+        radarTickFn = FindFunctionStart(client, callSites[0]);
+        Log("Radar POV: radar mode fn @ %p (E8 callers=%zu, size 0x%zx)",
+            reinterpret_cast<void*>(radarModeFn), callSites.size(), ApproxFnSize(fn));
+        break;
     }
-    if (radarModeFn == 0) {
-        Log("Radar POV: radar mode function not found");
-        return false;
-    }
-    Log("Radar POV: radar mode fn @ %p (approx size 0x%zx)", reinterpret_cast<void*>(radarModeFn), bestModeSize);
-
-    // Find callers of radarModeFn via relative E8 scan of the whole module
-    // (expensive but one-shot at install).
-    uintptr_t radarTickFn = 0;
-    {
-        const uintptr_t mode = radarModeFn;
-        for (size_t i = 0; i + 5 < client.size; ++i) {
-            if (client.base[i] != 0xE8) {
-                continue;
-            }
-            uintptr_t target = 0;
-            if (!DecodeRel32Call(client.base + i, reinterpret_cast<uintptr_t>(client.base) + i, target)) {
-                continue;
-            }
-            if (target != mode) {
-                continue;
-            }
-            uintptr_t caller = FindFunctionStart(client, reinterpret_cast<uintptr_t>(client.base) + i);
-            if (caller != 0 && caller != mode) {
-                radarTickFn = caller;
-                break;
-            }
-        }
-    }
-    if (radarTickFn == 0) {
-        Log("Radar POV: radar tick function not found");
+    if (radarModeFn == 0 || radarTickFn == 0 || radarTickFn == radarModeFn) {
+        Log("Radar POV: radar mode/tick function not found");
         return false;
     }
     Log("Radar POV: radar tick fn @ %p", reinterpret_cast<void*>(radarTickFn));
@@ -664,18 +699,12 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         return false;
     }
 
-    auto approxFnSize = [](uintptr_t fn) -> size_t {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-        for (size_t i = 0; i < 0x400; ++i) {
-            if (p[i] == 0xCC && p[i + 1] == 0xCC) {
-                return i;
-            }
-        }
-        return 0x400;
-    };
-
     std::vector<uintptr_t> earlyUnique;
     for (uintptr_t c : playerCalls) {
+        // Discard bogus decode targets outside client.dll.
+        if (!IsInsideModule(client, c)) {
+            continue;
+        }
         bool seen = false;
         for (uintptr_t u : earlyUnique) {
             if (u == c) {
@@ -695,31 +724,15 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     uintptr_t getObsFn = 0;
     uintptr_t isEnemyFn = 0;
 
-    // getSlot ≈ second direct call in the entry path (after getLocal).
+    // From Ghidra entry path: getLocal, getSlot, getObserverTarget, ...
     if (earlyUnique.size() >= 2) {
         getSlotFn = earlyUnique[1];
     }
-
-    // getObserverTarget is a small helper (~0x30-0x80) among early calls.
-    for (size_t i = 2; i < earlyUnique.size(); ++i) {
-        const size_t sz = approxFnSize(earlyUnique[i]);
-        if (sz >= 0x20 && sz <= 0x90) {
-            getObsFn = earlyUnique[i];
-            break;
-        }
-    }
-    if (getObsFn == 0) {
-        for (uintptr_t c : earlyUnique) {
-            const size_t sz = approxFnSize(c);
-            if (sz >= 0x20 && sz <= 0x90 && c != getSlotFn && c != earlyUnique[0]) {
-                getObsFn = c;
-                break;
-            }
-        }
+    if (earlyUnique.size() >= 3) {
+        getObsFn = earlyUnique[2];
     }
 
-    // isEnemy: called just before the show-all flag test at +0x17760.
-    // Scan the players function for disp32 0x00017760 and walk backward for E8.
+    // isEnemy: called a few hundred bytes before the show-all flag test at +0x17760.
     {
         const uint8_t* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
         const uint8_t flagDisp[4] = {0x60, 0x77, 0x01, 0x00}; // +0x17760 little-endian
@@ -727,19 +740,25 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
             if (memcmp(body + i, flagDisp, 4) != 0) {
                 continue;
             }
-            // Search backward up to 0x80 bytes for a relative call.
-            const size_t backStart = i > 0x80 ? i - 0x80 : 0;
+            // Prefer test/cmp forms: F6/F7/80/81 ... disp32
+            // Walk farther back — isEnemy sits well before the flag test.
+            const size_t backStart = i > 0x300 ? i - 0x300 : 0;
             for (size_t j = i; j-- > backStart;) {
                 uintptr_t target = 0;
                 if (!DecodeRel32Call(body + j, radarPlayersFn + j, target)) {
                     continue;
                 }
-                if (target == getSlotFn || target == getObsFn || target == earlyUnique[0]) {
+                if (!IsInsideModule(client, target)) {
                     continue;
                 }
-                const size_t sz = approxFnSize(target);
-                // isEnemy is medium-sized (~0x80-0x180 in the dump).
-                if (sz >= 0x40 && sz <= 0x280) {
+                if (target == getSlotFn || target == getObsFn ||
+                    (!earlyUnique.empty() && target == earlyUnique[0])) {
+                    continue;
+                }
+                const size_t sz = ApproxFnSize(target);
+                // isEnemy is medium-sized (~0x100). Exclude tiny helpers (cvar get,
+                // math) and huge utilities.
+                if (sz >= 0xA0 && sz <= 0x180) {
                     isEnemyFn = target;
                     break;
                 }
@@ -750,13 +769,13 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
-    // Fallback for isEnemy: medium-sized early-unique call that is not slot/obs/local.
+    // Fallback: first medium-sized unique call after obs/slot that is not getLocal.
     if (isEnemyFn == 0) {
         for (uintptr_t c : earlyUnique) {
-            if (c == getSlotFn || c == getObsFn || c == earlyUnique[0]) {
+            if (c == getSlotFn || c == getObsFn || (!earlyUnique.empty() && c == earlyUnique[0])) {
                 continue;
             }
-            const size_t sz = approxFnSize(c);
+            const size_t sz = ApproxFnSize(c);
             if (sz >= 0x60 && sz <= 0x200) {
                 isEnemyFn = c;
                 break;
