@@ -23,22 +23,20 @@ namespace {
 RadarPovLogFn g_log = nullptr;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_installed{false};
-// Kept for console compatibility; true-POV no longer needs the old pawn redirects.
 std::atomic<bool> g_aggressiveRedirects{false};
 
-// Set for the duration of CCSGO_HudRadar player-icon update so getLocal only
-// redirects when the radar is evaluating icons (not unrelated game code).
+// Only redirect getLocal while CCSGO_HudRadar is building player icons.
 thread_local int g_inRadarPlayerUpdate = 0;
+// Observer-target *pawn* used as self for this radar tick (same type as getLocal).
+thread_local void* g_povSelfPawn = nullptr;
+thread_local bool g_povActive = false;
 
-// Cached observed controller for the current radar tick (same thread as update).
-thread_local void* g_povSelfController = nullptr;
-thread_local void* g_realLocalController = nullptr;
-
-// First-fault log throttles so a tight radar loop cannot flood csdm.log.
 std::atomic<int> g_faultRadarMode{0};
 std::atomic<int> g_faultRadarPlayers{0};
 std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
+std::atomic<int> g_logPovOk{0};
+std::atomic<int> g_logPovFail{0};
 
 void Log(const char* fmt, ...)
 {
@@ -100,7 +98,6 @@ const char* FindCString(const ModuleInfo& mod, const char* str)
     return reinterpret_cast<const char*>(FindBytes(mod.base, mod.size, str, len));
 }
 
-// LEA r64, [rip+rel32]  →  rex 8D modrm rel32  (7 bytes), modrm rm=101, mod=00
 bool DecodeLeaRip(const uint8_t* insn, uintptr_t insnAddr, uintptr_t& targetOut, size_t& sizeOut)
 {
     if (insn == nullptr) {
@@ -159,10 +156,6 @@ bool LooksLikePrologue(const uint8_t* p)
     if (p[0] == 0x41 && (p[1] >= 0x54 && p[1] <= 0x57)) {
         return true;
     }
-    // Pure helpers often start with: mov edx, [rcx+imm32]
-    if (p[0] == 0x8B && (p[1] & 0xC7) == 0x81) {
-        return true;
-    }
     return false;
 }
 
@@ -214,31 +207,29 @@ std::vector<uintptr_t> CollectDirectCalls(uintptr_t fn, size_t maxScan = 0x800)
 }
 
 // ---------------------------------------------------------------------------
-// Hooks via MinHook
+// Hooks
 // ---------------------------------------------------------------------------
 
 using RadarModeFn = void(__fastcall*)(void* radar);
 using RadarPlayersFn = void(__fastcall*)(void* radar);
 using GetLocalFn = void*(__fastcall*)();
-using GetObserverTargetFn = void*(__fastcall*)(void* localController);
-using GetControllerFromPawnFn = void*(__fastcall*)(void* pawn);
+// getObs(localPawn) — first insn is mov rcx,[rcx+0x1220] (observer services on pawn).
+using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
 
 RadarModeFn g_origRadarMode = nullptr;
 RadarPlayersFn g_origRadarPlayers = nullptr;
 GetLocalFn g_origGetLocal = nullptr;
 GetObserverTargetFn g_getObserverTarget = nullptr;
-GetControllerFromPawnFn g_getControllerFromPawn = nullptr;
-
-// Fallback when pure GetControllerFromPawn helper is not found.
-void** g_entityListChunks = nullptr; // chunk table base (engine: table[idx>>9])
-uintptr_t g_entityListGlobalSlot = 0; // &global holding chunk table*; re-read if null at install
-ptrdiff_t g_offMhController = 0x13d0; // schema default for this dump; refined at runtime
-// Controller field used by getObs: mov rcx, [rcx+0x1220]
-constexpr ptrdiff_t kControllerObserverServices = 0x1220;
-// IsObserver-ish check in players: call [vtable+0xaa0]
-constexpr size_t kIsObserverVtableByteOff = 0xaa0;
 
 bool g_minhookInitialized = false;
+
+// getLocal validates return with vtable+0x4D8 = IsPlayerPawn (index 155).
+constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
+// players / mode: call [vtable+0xAA0] before getObs.
+constexpr size_t kIsObserverVtableByteOff = 0xAA0;
+// Observer services pointer on pawn (getObs first load).
+constexpr ptrdiff_t kPawnObserverServices = 0x1220;
+constexpr ptrdiff_t kRadarShowAllFlagOffset = 0x17760;
 
 const char* MhStatusName(MH_STATUS st)
 {
@@ -283,155 +274,94 @@ bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const c
     return true;
 }
 
-// Radar show-all bit written by mode setup when spectating + cvar.
-constexpr ptrdiff_t kRadarShowAllFlagOffset = 0x17760;
-
-void ForceClearShowAllFlag(void* radar)
+void SetShowAllFlag(void* radar, bool showAll)
 {
     if (radar == nullptr) {
         return;
     }
     auto* flags = reinterpret_cast<uint8_t*>(radar) + kRadarShowAllFlagOffset;
-    *flags = static_cast<uint8_t>(*flags & ~static_cast<uint8_t>(1));
-}
-
-// ---------------------------------------------------------------------------
-// Entity handle resolve (matches engine: index&0x7fff, chunk>>9, stride 0x70)
-// ---------------------------------------------------------------------------
-
-void RefreshEntityListChunks()
-{
-    if (g_entityListChunks != nullptr) {
-        return;
-    }
-    if (g_entityListGlobalSlot == 0) {
-        return;
-    }
-    void* list = *reinterpret_cast<void**>(g_entityListGlobalSlot);
-    if (list != nullptr) {
-        g_entityListChunks = reinterpret_cast<void**>(list);
+    if (showAll) {
+        *flags = static_cast<uint8_t>(*flags | static_cast<uint8_t>(1));
+    } else {
+        *flags = static_cast<uint8_t>(*flags & ~static_cast<uint8_t>(1));
     }
 }
 
-void* ResolveEntityHandle(uint32_t handle)
+// Call virtual bool method at byte offset (MSVC x64 thiscall = rcx).
+bool CallVBool(void* obj, size_t vtableByteOff)
 {
-    if (handle == 0xFFFFFFFFu || handle == 0xFFFFFFFEu) {
-        return nullptr;
-    }
-    RefreshEntityListChunks();
-    void** chunks = g_entityListChunks;
-    if (chunks == nullptr) {
-        return nullptr;
-    }
-    const uint32_t index = handle & 0x7FFFu;
-    const uint32_t chunkIndex = index >> 9;
-    const uint32_t entryIndex = index & 0x1FFu;
-    if (chunkIndex > 0x3F) {
-        return nullptr;
-    }
-    uint8_t* chunk = reinterpret_cast<uint8_t*>(chunks[chunkIndex]);
-    if (chunk == nullptr) {
-        return nullptr;
-    }
-    uint8_t* identity = chunk + static_cast<size_t>(entryIndex) * 0x70u;
-    // identity+0x10 holds the full handle for serial match
-    const uint32_t stored = *reinterpret_cast<uint32_t*>(identity + 0x10);
-    if (stored != handle) {
-        return nullptr;
-    }
-    return *reinterpret_cast<void**>(identity); // CEntityInstance*
-}
-
-void* GetControllerFromPawnFallback(void* pawn)
-{
-    if (pawn == nullptr || g_offMhController <= 0) {
-        return nullptr;
-    }
-    const uint32_t handle =
-        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(pawn) + g_offMhController);
-    return ResolveEntityHandle(handle);
-}
-
-void* GetControllerFromPawn(void* pawn)
-{
-    if (pawn == nullptr) {
-        return nullptr;
-    }
-    if (g_getControllerFromPawn != nullptr) {
-        __try {
-            void* ctrl = g_getControllerFromPawn(pawn);
-            if (ctrl != nullptr) {
-                return ctrl;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            if (g_faultResolve.fetch_add(1) == 0) {
-                Log("Radar POV: EXCEPTION in GetControllerFromPawn helper (code=0x%08lX)",
-                    GetExceptionCode());
-            }
-        }
-    }
-    __try {
-        return GetControllerFromPawnFallback(pawn);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (g_faultResolve.fetch_add(1) == 0) {
-            Log("Radar POV: EXCEPTION in handle resolve (code=0x%08lX)", GetExceptionCode());
-        }
-        return nullptr;
-    }
-}
-
-bool ControllerLooksObserving(void* controller)
-{
-    if (controller == nullptr) {
+    if (obj == nullptr) {
         return false;
     }
     __try {
-        // Prefer the same vtable method players uses (byte offset 0xaa0).
-        void** vtable = *reinterpret_cast<void***>(controller);
-        if (vtable != nullptr) {
-            using IsObsFn = uint8_t(__fastcall*)(void*);
-            auto fn = reinterpret_cast<IsObsFn>(vtable[kIsObserverVtableByteOff / sizeof(void*)]);
-            if (fn != nullptr && fn(controller) != 0) {
-                return true;
-            }
+        void** vtable = *reinterpret_cast<void***>(obj);
+        if (vtable == nullptr) {
+            return false;
         }
-        // Fallback: observer services pointer at +0x1220 (getObs first load).
+        using Fn = uint8_t(__fastcall*)(void*);
+        auto fn = reinterpret_cast<Fn>(vtable[vtableByteOff / sizeof(void*)]);
+        if (fn == nullptr) {
+            return false;
+        }
+        return fn(obj) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool IsPlayerPawn(void* ent)
+{
+    return CallVBool(ent, kIsPlayerPawnVtableByteOff);
+}
+
+bool LooksObserving(void* localPawn)
+{
+    if (localPawn == nullptr) {
+        return false;
+    }
+    if (CallVBool(localPawn, kIsObserverVtableByteOff)) {
+        return true;
+    }
+    // Fallback: non-null observer services (getObs loads [pawn+0x1220] without null check).
+    __try {
         void* services =
-            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(controller) + kControllerObserverServices);
+            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(localPawn) + kPawnObserverServices);
         return services != nullptr;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-// Resolve "self" for radar: observed player's controller when spectating.
-void* ResolvePovSelfController(void* realLocal)
+// Live radar "self" is a pawn. When spectating, self should be the target pawn.
+void* ResolvePovSelfPawn(void* realLocalPawn)
 {
-    if (realLocal == nullptr || g_getObserverTarget == nullptr) {
+    if (realLocalPawn == nullptr || g_getObserverTarget == nullptr) {
         return nullptr;
     }
-    if (!ControllerLooksObserving(realLocal)) {
+    if (!LooksObserving(realLocalPawn)) {
         return nullptr;
     }
-    void* pawn = nullptr;
+    void* target = nullptr;
     __try {
-        pawn = g_getObserverTarget(realLocal);
+        target = g_getObserverTarget(realLocalPawn);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (g_faultResolve.fetch_add(1) == 0) {
-            Log("Radar POV: EXCEPTION in getObs (code=0x%08lX) local=%p", GetExceptionCode(),
-                realLocal);
+            Log("Radar POV: EXCEPTION in getObs (code=0x%08lX) localPawn=%p", GetExceptionCode(),
+                realLocalPawn);
         }
         return nullptr;
     }
-    if (pawn == nullptr || pawn == realLocal) {
+    if (target == nullptr || target == realLocalPawn) {
         return nullptr;
     }
-    void* ctrl = GetControllerFromPawn(pawn);
-    // If pawn already *is* a controller path failure, or handle points to self, skip.
-    if (ctrl == nullptr || ctrl == realLocal) {
+    // Must be a pawn — same type getLocal returns (never a controller).
+    if (!IsPlayerPawn(target)) {
+        if (g_logPovFail.fetch_add(1) == 0) {
+            Log("Radar POV: getObs returned non-pawn %p (rejected)", target);
+        }
         return nullptr;
     }
-    return ctrl;
+    return target;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,9 +374,8 @@ void __fastcall Hook_RadarMode(void* radar)
         if (g_origRadarMode != nullptr) {
             g_origRadarMode(radar);
         }
-        if (g_enabled.load(std::memory_order_relaxed) && radar != nullptr) {
-            ForceClearShowAllFlag(radar);
-        }
+        // Do not force show-all off here. players hook decides based on POV success.
+        // Clearing here + failed POV left the radar empty.
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (g_faultRadarMode.fetch_add(1) == 0) {
             Log("Radar POV: EXCEPTION in Hook_RadarMode (code=0x%08lX) radar=%p",
@@ -469,61 +398,90 @@ void* __fastcall Hook_GetLocal()
         return nullptr;
     }
 
-    if (!g_enabled.load(std::memory_order_relaxed) || g_inRadarPlayerUpdate <= 0) {
+    if (!g_enabled.load(std::memory_order_relaxed) || g_inRadarPlayerUpdate <= 0 || !g_povActive) {
         return real;
     }
-
-    // Reuse cached POV self for this radar tick (getLocal may be called once,
-    // but keep the path safe if the engine calls it again inside the update).
-    if (g_povSelfController != nullptr) {
-        return g_povSelfController;
-    }
-    if (g_realLocalController == nullptr) {
-        g_realLocalController = real;
-    }
-
-    void* pov = ResolvePovSelfController(real);
-    if (pov != nullptr) {
-        g_povSelfController = pov;
-        return pov;
+    if (g_povSelfPawn != nullptr) {
+        return g_povSelfPawn;
     }
     return real;
 }
 
 void __fastcall Hook_RadarPlayers(void* radar)
 {
-    const bool pov = g_enabled.load(std::memory_order_relaxed);
-    if (pov) {
+    const bool wantPov = g_enabled.load(std::memory_order_relaxed);
+    g_povSelfPawn = nullptr;
+    g_povActive = false;
+
+    if (wantPov) {
         ++g_inRadarPlayerUpdate;
-        g_povSelfController = nullptr;
-        g_realLocalController = nullptr;
     }
+
     __try {
-        if (pov && radar != nullptr) {
-            ForceClearShowAllFlag(radar);
+        // Resolve POV *before* the engine update, using the real getLocal pawn.
+        if (wantPov && g_origGetLocal != nullptr && g_getObserverTarget != nullptr) {
+            void* realPawn = nullptr;
+            __try {
+                realPawn = g_origGetLocal();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                realPawn = nullptr;
+            }
+            void* povPawn = ResolvePovSelfPawn(realPawn);
+            if (povPawn != nullptr) {
+                g_povSelfPawn = povPawn;
+                g_povActive = true;
+                SetShowAllFlag(radar, false);
+                if (g_logPovOk.fetch_add(1) == 0) {
+                    Log("Radar POV: active — self pawn %p -> observed pawn %p (show-all cleared)",
+                        realPawn, povPawn);
+                }
+            } else {
+                // Fail-safe: keep/force show-all so the radar is not empty.
+                SetShowAllFlag(radar, true);
+                if (g_logPovFail.fetch_add(1) == 0) {
+                    Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p",
+                        realPawn);
+                }
+            }
         }
+
         if (g_origRadarPlayers != nullptr) {
             g_origRadarPlayers(radar);
         }
-        if (pov && radar != nullptr) {
-            // Mode can re-set the bit; clear again after player icons.
-            ForceClearShowAllFlag(radar);
+
+        // Re-apply flag after update (mode/other code may touch it mid-frame).
+        if (wantPov && radar != nullptr) {
+            if (g_povActive) {
+                SetShowAllFlag(radar, false);
+            } else {
+                SetShowAllFlag(radar, true);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (g_faultRadarPlayers.fetch_add(1) == 0) {
-            Log("Radar POV: EXCEPTION in Hook_RadarPlayers (code=0x%08lX) radar=%p",
-                GetExceptionCode(), radar);
+            Log("Radar POV: EXCEPTION in Hook_RadarPlayers (code=0x%08lX) radar=%p povActive=%d "
+                "pov=%p",
+                GetExceptionCode(), radar, g_povActive ? 1 : 0, g_povSelfPawn);
+        }
+        // After a crash in the update, force show-all so next frames still show someone
+        // if the exception path left partial state — best effort only.
+        __try {
+            if (radar != nullptr) {
+                SetShowAllFlag(radar, true);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
-    if (pov && g_inRadarPlayerUpdate > 0) {
+
+    if (wantPov && g_inRadarPlayerUpdate > 0) {
         --g_inRadarPlayerUpdate;
-        g_povSelfController = nullptr;
-        g_realLocalController = nullptr;
     }
+    g_povSelfPawn = nullptr;
+    g_povActive = false;
 }
 
 // ---------------------------------------------------------------------------
-// Signature resolution from the Ghidra-mapped call chain
+// Signature resolution
 // ---------------------------------------------------------------------------
 
 bool IsInsideModule(const ModuleInfo& mod, uintptr_t addr)
@@ -556,7 +514,7 @@ bool IsLikelyDataObject(const ModuleInfo& mod, uintptr_t addr)
 size_t ApproxFnSize(uintptr_t fn)
 {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-    for (size_t i = 0x20; i < 0x800; ++i) {
+    for (size_t i = 0x20; i < 0x2000; ++i) {
         if (p[i] == 0xCC && p[i + 1] == 0xCC) {
             return i;
         }
@@ -586,180 +544,8 @@ std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
     return sites;
 }
 
-// Discover C_BasePlayerPawn::m_hController offset from schema field registration
-// near the "m_hController" string (mov dword [reg+0x10], imm32).
-bool ResolveMhControllerOffset(const ModuleInfo& client)
-{
-    const char* name = FindCString(client, "m_hController");
-    if (name == nullptr) {
-        Log("Radar POV: m_hController string missing; using default 0x%zx",
-            static_cast<size_t>(g_offMhController));
-        return g_offMhController > 0;
-    }
-    const auto xrefs = FindLeaRipXrefs(client, reinterpret_cast<uintptr_t>(name));
-    for (uintptr_t lea : xrefs) {
-        // Search a window after the LEA for: C7 40 10 xx xx xx xx  (mov [rax+0x10], imm)
-        // or C7 44 24 xx xx xx xx xx (mov [rsp+..], imm) used by some registrars.
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(lea);
-        for (int i = 0; i < 0x40; ++i) {
-            if (p[i] == 0xC7 && p[i + 1] == 0x40 && p[i + 2] == 0x10) {
-                const uint32_t off = *reinterpret_cast<const uint32_t*>(p + i + 3);
-                if (off >= 0x100 && off < 0x4000) {
-                    g_offMhController = static_cast<ptrdiff_t>(off);
-                    Log("Radar POV: m_hController offset=0x%zx (schema)",
-                        static_cast<size_t>(g_offMhController));
-                    return true;
-                }
-            }
-            if (p[i] == 0xC7 && p[i + 1] == 0x44 && p[i + 2] == 0x24) {
-                const uint32_t off = *reinterpret_cast<const uint32_t*>(p + i + 4);
-                if (off >= 0x100 && off < 0x4000) {
-                    g_offMhController = static_cast<ptrdiff_t>(off);
-                    Log("Radar POV: m_hController offset=0x%zx (schema rsp)",
-                        static_cast<size_t>(g_offMhController));
-                    return true;
-                }
-            }
-        }
-    }
-    Log("Radar POV: m_hController offset not in schema xrefs; using default 0x%zx",
-        static_cast<size_t>(g_offMhController));
-    return g_offMhController > 0;
-}
-
-// Pure helper: mov edx,[rcx+m_hController]; resolve handle; return entity.
-// Pattern from this client: 8B 91 D0 13 00 00 45 33 D2 83 FA FF ...
-bool ResolveGetControllerFromPawn(const ModuleInfo& client)
-{
-    if (g_offMhController <= 0) {
-        return false;
-    }
-    // Encode: mov edx, dword ptr [rcx + disp32]
-    uint8_t pat[6] = {0x8B, 0x91, 0, 0, 0, 0};
-    *reinterpret_cast<uint32_t*>(pat + 2) = static_cast<uint32_t>(g_offMhController);
-
-    uintptr_t best = 0;
-    size_t bestSize = 0x7fffffff;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(client.base);
-
-    for (size_t i = 0; i + 16 < client.size; ++i) {
-        if (memcmp(client.base + i, pat, 6) != 0) {
-            continue;
-        }
-        // Prefer functions that *start* with this load (or INT3/ret immediately before).
-        if (i > 0) {
-            const uint8_t prev = client.base[i - 1];
-            if (!(prev == 0xCC || prev == 0xC3 || prev == 0x90)) {
-                continue;
-            }
-        }
-        const uintptr_t fn = base + i;
-        const size_t sz = ApproxFnSize(fn);
-        // Pure resolve helpers are small (~0x50-0x80). Exclude large consumers.
-        if (sz < 0x40 || sz > 0xA0) {
-            continue;
-        }
-        // Pure helpers end with: mov rax, [rax] ; ret  (optionally test/je null before ret).
-        // Reject helpers that then read another field (e.g. mov eax, [rax+imm]).
-        const uint8_t* body = client.base + i;
-        bool pureReturn = false;
-        for (size_t j = 0x30; j + 4 < sz; ++j) {
-            if (body[j] == 0x48 && body[j + 1] == 0x8B && body[j + 2] == 0x00) {
-                // Immediate ret
-                if (body[j + 3] == 0xC3) {
-                    pureReturn = true;
-                    break;
-                }
-                // test rax,rax ; je ; ret  OR  test rax,rax ; je ; mov rax,rcx ; ret
-                if (body[j + 3] == 0x48 && body[j + 4] == 0x85 && body[j + 5] == 0xC0) {
-                    // ensure no `mov e*x, [rax+imm]` in the next ~12 bytes after the load
-                    bool fieldLoad = false;
-                    for (size_t k = j + 3; k + 3 < sz && k < j + 16; ++k) {
-                        if (body[k] == 0x8B && (body[k + 1] & 0xC7) == 0x40) { // mov r32, [rax+disp8]
-                            fieldLoad = true;
-                            break;
-                        }
-                        if (body[k] == 0x8B && (body[k + 1] & 0xC7) == 0x80) { // mov r32, [rax+disp32]
-                            fieldLoad = true;
-                            break;
-                        }
-                    }
-                    if (!fieldLoad) {
-                        pureReturn = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (!pureReturn) {
-            continue;
-        }
-        // Extract entity-list global from: mov r64, [rip+disp] soon after cmp edx,-1
-        for (size_t j = 6; j + 7 < 0x20 && j + 7 < sz; ++j) {
-            // mov rcx/r8/... [rip+disp] is 48/4C 8B xx 05 ...
-            if ((body[j] == 0x48 || body[j] == 0x4C) && body[j + 1] == 0x8B &&
-                (body[j + 2] & 0xC7) == 0x05) {
-                const int32_t rel = *reinterpret_cast<const int32_t*>(body + j + 3);
-                const uintptr_t globalAddr = fn + j + 7 + rel;
-                if (IsInsideModule(client, globalAddr)) {
-                    if (g_entityListGlobalSlot == 0) {
-                        g_entityListGlobalSlot = globalAddr;
-                    }
-                    void* list = *reinterpret_cast<void**>(globalAddr);
-                    if (list != nullptr && g_entityListChunks == nullptr) {
-                        g_entityListChunks = reinterpret_cast<void**>(list);
-                    }
-                }
-            }
-        }
-        if (sz < bestSize) {
-            bestSize = sz;
-            best = fn;
-        }
-    }
-
-    if (best == 0) {
-        Log("Radar POV: pure GetControllerFromPawn helper not found");
-        return false;
-    }
-
-    // Re-extract entity list from the chosen function for reliability.
-    {
-        const uint8_t* body = reinterpret_cast<const uint8_t*>(best);
-        const size_t sz = ApproxFnSize(best);
-        for (size_t j = 6; j + 7 < 0x28 && j + 7 < sz; ++j) {
-            if ((body[j] == 0x48 || body[j] == 0x4C) && body[j + 1] == 0x8B &&
-                (body[j + 2] & 0xC7) == 0x05) {
-                const int32_t rel = *reinterpret_cast<const int32_t*>(body + j + 3);
-                const uintptr_t globalAddr = best + j + 7 + rel;
-                if (!IsInsideModule(client, globalAddr)) {
-                    continue;
-                }
-                g_entityListGlobalSlot = globalAddr;
-                void* list = *reinterpret_cast<void**>(globalAddr);
-                if (list != nullptr) {
-                    g_entityListChunks = reinterpret_cast<void**>(list);
-                    Log("Radar POV: entity list chunks @ %p (from helper global %p)",
-                        g_entityListChunks, reinterpret_cast<void*>(globalAddr));
-                } else {
-                    Log("Radar POV: entity list global @ %p is null at install (will retry on use)",
-                        reinterpret_cast<void*>(globalAddr));
-                }
-                break;
-            }
-        }
-    }
-
-    g_getControllerFromPawn = reinterpret_cast<GetControllerFromPawnFn>(best);
-    Log("Radar POV: GetControllerFromPawn @ %p size=0x%zx", reinterpret_cast<void*>(best),
-        bestSize);
-    return true;
-}
-
 bool ResolveRadarFunctions(const ModuleInfo& client)
 {
-    ResolveMhControllerOffset(client);
-
     const char* cvarName = FindCString(client, "cl_radar_show_all_players_when_spectating");
     if (cvarName == nullptr) {
         Log("Radar POV: cvar name string not found in client.dll");
@@ -844,7 +630,6 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         return false;
     }
 
-    // Tick: call mode; call intermediate; call players
     uintptr_t radarPlayersFn = 0;
     {
         const uintptr_t scanFrom = modeCallSite + 5;
@@ -861,8 +646,18 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
             afterMode.push_back(target);
             i += 4;
         }
+        // Prefer the largest of the first few calls as players (it is ~0xB00+; layout helpers smaller).
+        // Fall back to after[1] which matches the known call order: mode, layout, players.
         if (afterMode.size() >= 2) {
             radarPlayersFn = afterMode[1];
+            size_t bestSz = ApproxFnSize(radarPlayersFn);
+            for (size_t i = 0; i < afterMode.size() && i < 4; ++i) {
+                const size_t sz = ApproxFnSize(afterMode[i]);
+                if (sz > bestSz && sz >= 0x400) {
+                    bestSz = sz;
+                    radarPlayersFn = afterMode[i];
+                }
+            }
         } else if (afterMode.size() == 1) {
             radarPlayersFn = afterMode[0];
         }
@@ -877,9 +672,10 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         Log("Radar POV: radar players function not found");
         return false;
     }
-    Log("Radar POV: radar players fn @ %p", reinterpret_cast<void*>(radarPlayersFn));
+    Log("Radar POV: radar players fn @ %p size=0x%zx", reinterpret_cast<void*>(radarPlayersFn),
+        ApproxFnSize(radarPlayersFn));
 
-    // players: getLocal, getSlot, getObs, getTeam, ... isEnemy ...
+    // players body: getLocal, getSlot, getObs(+0x1220), getTeam, ...
     const auto playerCalls = CollectDirectCalls(radarPlayersFn, 0xC00);
     if (playerCalls.size() < 3) {
         Log("Radar POV: unexpected call graph in players fn (%zu calls)", playerCalls.size());
@@ -906,87 +702,40 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
-    uintptr_t getLocalFn = earlyUnique.size() >= 1 ? earlyUnique[0] : 0;
-    uintptr_t getObsFn = earlyUnique.size() >= 3 ? earlyUnique[2] : 0;
-
-    // Sanity: getLocal is tiny (~0x30-0x40), getObs medium.
-    if (getLocalFn != 0) {
-        const size_t sz = ApproxFnSize(getLocalFn);
-        if (sz > 0x80) {
-            Log("Radar POV: getLocal candidate size 0x%zx looks large; still trying", sz);
+    uintptr_t getLocalFn = earlyUnique.empty() ? 0 : earlyUnique[0];
+    uintptr_t getObsFn = 0;
+    // getObs: contains imm32 0x1220 near the start.
+    for (uintptr_t c : earlyUnique) {
+        if (c == getLocalFn) {
+            continue;
         }
-    }
-    if (getObsFn != 0) {
-        // getObs body contains imm 0x1220
-        const uint8_t* body = reinterpret_cast<const uint8_t*>(getObsFn);
-        bool has1220 = false;
-        for (size_t i = 0; i + 4 < 0x40; ++i) {
-            if (body[i] == 0x20 && body[i + 1] == 0x12 && body[i + 2] == 0x00 &&
-                body[i + 3] == 0x00) {
-                has1220 = true;
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(c);
+        for (size_t i = 0; i + 4 < 0x20; ++i) {
+            if (b[i] == 0x20 && b[i + 1] == 0x12 && b[i + 2] == 0x00 && b[i + 3] == 0x00) {
+                getObsFn = c;
                 break;
             }
         }
-        if (!has1220) {
-            Log("Radar POV: getObs candidate @ %p lacks +0x1220; scanning early calls",
-                reinterpret_cast<void*>(getObsFn));
-            getObsFn = 0;
-            for (uintptr_t c : earlyUnique) {
-                if (c == getLocalFn) {
-                    continue;
-                }
-                const uint8_t* b = reinterpret_cast<const uint8_t*>(c);
-                for (size_t i = 0; i + 4 < 0x40; ++i) {
-                    if (b[i] == 0x20 && b[i + 1] == 0x12 && b[i + 2] == 0x00 && b[i + 3] == 0x00) {
-                        getObsFn = c;
-                        break;
-                    }
-                }
-                if (getObsFn != 0) {
-                    break;
-                }
-            }
+        if (getObsFn != 0) {
+            break;
         }
+    }
+    // Fallback index 2 from known Ghidra order.
+    if (getObsFn == 0 && earlyUnique.size() >= 3) {
+        getObsFn = earlyUnique[2];
+    }
+
+    // Sanity: getLocal should be small and contain call to IsPlayerPawn path.
+    if (getLocalFn != 0) {
+        Log("Radar POV: helpers getLocal=%p size=0x%zx getObs=%p size=0x%zx",
+            reinterpret_cast<void*>(getLocalFn), ApproxFnSize(getLocalFn),
+            reinterpret_cast<void*>(getObsFn), getObsFn ? ApproxFnSize(getObsFn) : 0);
     }
 
     if (getLocalFn == 0 || getObsFn == 0) {
         Log("Radar POV: helpers incomplete (getLocal=%p getObs=%p)",
             reinterpret_cast<void*>(getLocalFn), reinterpret_cast<void*>(getObsFn));
-        // Mode+players only still clears show-all (safe partial).
-    } else {
-        Log("Radar POV: helpers getLocal=%p getObs=%p", reinterpret_cast<void*>(getLocalFn),
-            reinterpret_cast<void*>(getObsFn));
-    }
-
-    // Pure pawn->controller + entity list.
-    if (!ResolveGetControllerFromPawn(client)) {
-        Log("Radar POV: will use inline handle resolve if entity list is known");
-    }
-
-    // If entity list still null, pull from getObs-adjacent getTeam or getPawn helper.
-    if (g_entityListChunks == nullptr && earlyUnique.size() >= 4) {
-        // earlyUnique[3] is often getTeam which loads entity list the same way.
-        const uintptr_t getTeamFn = earlyUnique[3];
-        const uint8_t* body = reinterpret_cast<const uint8_t*>(getTeamFn);
-        const size_t sz = ApproxFnSize(getTeamFn);
-        for (size_t j = 0; j + 7 < sz && j < 0x30; ++j) {
-            if ((body[j] == 0x48 || body[j] == 0x4C) && body[j + 1] == 0x8B &&
-                (body[j + 2] & 0xC7) == 0x05) {
-                const int32_t rel = *reinterpret_cast<const int32_t*>(body + j + 3);
-                const uintptr_t globalAddr = getTeamFn + j + 7 + rel;
-                if (!IsInsideModule(client, globalAddr)) {
-                    continue;
-                }
-                g_entityListGlobalSlot = globalAddr;
-                void* list = *reinterpret_cast<void**>(globalAddr);
-                if (list != nullptr) {
-                    g_entityListChunks = reinterpret_cast<void**>(list);
-                }
-                Log("Radar POV: entity list from getTeam global @ %p -> %p",
-                    reinterpret_cast<void*>(globalAddr), g_entityListChunks);
-                break;
-            }
-        }
+        // Still install mode+players for fail-safe show-all handling.
     }
 
     g_origRadarMode = reinterpret_cast<RadarModeFn>(radarModeFn);
@@ -1037,26 +786,21 @@ bool InstallHooks()
         return false;
     }
 
-    // Core true-POV: redirect getLocal → observed controller during radar update.
     if (getLocalTarget != nullptr && g_getObserverTarget != nullptr) {
         if (!CreateAndEnableHook(getLocalTarget, reinterpret_cast<void*>(&Hook_GetLocal),
                                  reinterpret_cast<void**>(&g_origGetLocal), "getLocal")) {
-            Log("Radar POV: getLocal hook failed — falling back to show-all clear only");
+            Log("Radar POV: getLocal hook failed — fail-safe show-all only");
             g_origGetLocal = reinterpret_cast<GetLocalFn>(getLocalTarget);
         }
     } else {
-        Log("Radar POV: getLocal/getObs unresolved — show-all clear only (not full POV)");
+        Log("Radar POV: getLocal/getObs unresolved — fail-safe show-all only");
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d getLocal=%d getObs=%d ctrlFromPawn=%d entityList=%d "
-        "m_hController=0x%zx)",
+    Log("Radar POV: installed (enabled=%d getLocal=%d getObs=%d) — self type is PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0,
-        g_getObserverTarget != nullptr ? 1 : 0,
-        g_getControllerFromPawn != nullptr ? 1 : 0,
-        g_entityListChunks != nullptr ? 1 : 0,
-        static_cast<size_t>(g_offMhController));
+        g_getObserverTarget != nullptr ? 1 : 0);
     return true;
 }
 
@@ -1071,9 +815,6 @@ void UninstallHooks()
     g_origRadarPlayers = nullptr;
     g_origGetLocal = nullptr;
     g_getObserverTarget = nullptr;
-    g_getControllerFromPawn = nullptr;
-    g_entityListChunks = nullptr;
-    g_entityListGlobalSlot = 0;
     g_installed.store(false, std::memory_order_release);
     Log("Radar POV: MinHook hooks removed");
 }
@@ -1115,8 +856,7 @@ bool RadarPov_IsEnabled()
 void RadarPov_SetAggressiveRedirects(bool enabled)
 {
     g_aggressiveRedirects.store(enabled, std::memory_order_relaxed);
-    Log("Radar POV: aggressive_redirects=%d (legacy flag; true POV uses getLocal redirect)",
-        enabled ? 1 : 0);
+    Log("Radar POV: aggressive_redirects=%d (legacy; unused)", enabled ? 1 : 0);
 }
 
 bool RadarPov_AggressiveRedirectsEnabled()
@@ -1150,6 +890,7 @@ void RadarPov_QueueEngineSetup(void (*queueCmd)(const char* cmd))
     if (queueCmd == nullptr || !g_enabled.load(std::memory_order_relaxed)) {
         return;
     }
+    // Prefer FOG when POV works; Hook_RadarPlayers forces show-all if POV fails.
     queueCmd("cl_radar_show_all_players_when_spectating 0");
     queueCmd("cl_radar_square_when_spectating 0");
 }
