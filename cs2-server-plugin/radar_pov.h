@@ -25,10 +25,6 @@ void RadarPov_SetLogger(RadarPovLogFn logger);
 void RadarPov_SetEnabled(bool enabled);
 bool RadarPov_IsEnabled();
 
-// Legacy console flag; true POV does not use the old is_enemy pawn mis-hooks.
-void RadarPov_SetAggressiveRedirects(bool enabled);
-bool RadarPov_AggressiveRedirectsEnabled();
-
 bool RadarPov_Install();
 void RadarPov_Uninstall();
 bool RadarPov_IsInstalled();

@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -23,7 +22,6 @@ namespace {
 RadarPovLogFn g_log = nullptr;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_installed{false};
-std::atomic<bool> g_aggressiveRedirects{false};
 
 // Redirect getLocal for the complete CCSGO_HudRadar update. Player icons alone
 // are not enough: radar_mode runs first and chooses the spectator vs. live-POV
@@ -82,6 +80,23 @@ bool GetModuleInfo(const char* name, ModuleInfo& out)
     out.base = reinterpret_cast<uint8_t*>(info.lpBaseOfDll);
     out.size = static_cast<size_t>(info.SizeOfImage);
     return out.base != nullptr && out.size > 0;
+}
+
+uint32_t GetPeTimestamp(const ModuleInfo& mod)
+{
+    if (mod.base == nullptr || mod.size < sizeof(IMAGE_DOS_HEADER)) {
+        return 0;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod.base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > mod.size) {
+        return 0;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod.base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return 0;
+    }
+    return nt->FileHeader.TimeDateStamp;
 }
 
 const uint8_t* FindBytes(const uint8_t* begin, size_t size, const void* needle, size_t needleSize)
@@ -254,9 +269,10 @@ constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
 constexpr size_t kIsObserverVtableByteOff = 0xAA0;
 // Observer services pointer on pawn (getObs first load).
 constexpr ptrdiff_t kPawnObserverServices = 0x1220;
-constexpr ptrdiff_t kRadarShowAllFlagOffset = 0x17760;
 // Current radar update wrapper derives CCSGO_HudRadar as `lea rsi,[rcx-20h]`.
 constexpr ptrdiff_t kRadarFromUpdateContext = -0x20;
+// Resolved from radar_mode's `and byte ptr [radar+offset], ~1` instruction.
+ptrdiff_t g_radarShowAllFlagOffset = 0;
 
 const char* MhStatusName(MH_STATUS st)
 {
@@ -303,10 +319,10 @@ bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const c
 
 void SetShowAllFlag(void* radar, bool showAll)
 {
-    if (radar == nullptr) {
+    if (radar == nullptr || g_radarShowAllFlagOffset <= 0) {
         return;
     }
-    auto* flags = reinterpret_cast<uint8_t*>(radar) + kRadarShowAllFlagOffset;
+    auto* flags = reinterpret_cast<uint8_t*>(radar) + g_radarShowAllFlagOffset;
     if (showAll) {
         *flags = static_cast<uint8_t>(*flags | static_cast<uint8_t>(1));
     } else {
@@ -625,6 +641,7 @@ std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
 bool ResolveRadarFunctions(const ModuleInfo& client)
 {
     g_radarDemoStateGlobalSlot = 0;
+    g_radarShowAllFlagOffset = 0;
     const char* cvarName = FindCString(client, "cl_radar_show_all_players_when_spectating");
     if (cvarName == nullptr) {
         Log("Radar POV: cvar name string not found in client.dll");
@@ -708,6 +725,23 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         Log("Radar POV: radar mode function not found");
         return false;
     }
+
+    // The first operation in radar_mode clears its show-all bit:
+    // `and byte ptr [radar+offset], ~1`. Resolve the offset rather than
+    // assuming it remains 0x17760 after a client update.
+    for (size_t i = 0; i + 7 <= ApproxFnSize(radarModeFn); ++i) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(radarModeFn + i);
+        if (b[0] == 0x80 && b[1] == 0xA3 && b[6] == 0xFE) {
+            g_radarShowAllFlagOffset =
+                static_cast<ptrdiff_t>(*reinterpret_cast<const uint32_t*>(b + 2));
+            break;
+        }
+    }
+    if (g_radarShowAllFlagOffset <= 0) {
+        Log("Radar POV: show-all flag offset not found");
+        return false;
+    }
+    Log("Radar POV: show-all flag offset=0x%zx", static_cast<size_t>(g_radarShowAllFlagOffset));
 
     // The direct caller runs radar_mode, player updates and sound snippets as
     // one HUD frame. Validate its current wrapper shape before relying on the
@@ -933,6 +967,37 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     return true;
 }
 
+void ResetResolvedRadarState()
+{
+    g_origRadarUpdate = nullptr;
+    g_origRadarPresentation = nullptr;
+    g_origRadarDemoState = nullptr;
+    g_origGetLocal = nullptr;
+    g_getObserverTarget = nullptr;
+    g_getPlayerSlot = nullptr;
+    g_origFindPlayerBySlot = nullptr;
+    g_spectatorFilterHooked = false;
+    g_radarDemoStateGlobalSlot = 0;
+    g_radarShowAllFlagOffset = 0;
+    g_installed.store(false, std::memory_order_release);
+}
+
+void DisableInstalledHooks()
+{
+    if (!g_minhookInitialized) {
+        return;
+    }
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+    g_minhookInitialized = false;
+}
+
+void AbortInstall()
+{
+    DisableInstalledHooks();
+    ResetResolvedRadarState();
+}
+
 bool InstallHooks()
 {
     ModuleInfo client = {};
@@ -940,7 +1005,8 @@ bool InstallHooks()
         Log("Radar POV: client.dll not loaded yet");
         return false;
     }
-    Log("Radar POV: client.dll @ %p size=0x%zx", client.base, client.size);
+    Log("Radar POV: client.dll @ %p size=0x%zx PE-timestamp=0x%08X", client.base, client.size,
+        GetPeTimestamp(client));
 
     if (!ResolveRadarFunctions(client)) {
         return false;
@@ -949,6 +1015,7 @@ bool InstallHooks()
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
         Log("Radar POV: MH_Initialize failed: %s (%d)", MhStatusName(st), static_cast<int>(st));
+        ResetResolvedRadarState();
         return false;
     }
     g_minhookInitialized = true;
@@ -961,8 +1028,7 @@ bool InstallHooks()
 
     if (!CreateAndEnableHook(updateTarget, reinterpret_cast<void*>(&Hook_RadarUpdate),
                              reinterpret_cast<void**>(&g_origRadarUpdate), "radar_update")) {
-        MH_Uninitialize();
-        g_minhookInitialized = false;
+        AbortInstall();
         return false;
     }
 
@@ -970,28 +1036,19 @@ bool InstallHooks()
         if (!CreateAndEnableHook(getLocalTarget, reinterpret_cast<void*>(&Hook_GetLocal),
                                  reinterpret_cast<void**>(&g_origGetLocal), "getLocal")) {
             Log("Radar POV: getLocal hook failed");
-            MH_DisableHook(MH_ALL_HOOKS);
-            MH_Uninitialize();
-            g_minhookInitialized = false;
-            g_origRadarUpdate = nullptr;
+            AbortInstall();
             return false;
         }
     } else {
         Log("Radar POV: getLocal/getObs unresolved");
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        g_minhookInitialized = false;
-        g_origRadarUpdate = nullptr;
+        AbortInstall();
         return false;
     }
 
     if (!CreateAndEnableHook(presentationTarget, reinterpret_cast<void*>(&Hook_RadarPresentation),
                              reinterpret_cast<void**>(&g_origRadarPresentation),
                              "radar_presentation")) {
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        g_minhookInitialized = false;
-        g_origRadarUpdate = nullptr;
+        AbortInstall();
         return false;
     }
 
@@ -1004,10 +1061,7 @@ bool InstallHooks()
     }
     if (!CreateAndEnableHook(demoStateTarget, reinterpret_cast<void*>(&Hook_RadarDemoState),
                              reinterpret_cast<void**>(&g_origRadarDemoState), "radar_demo_state")) {
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        g_minhookInitialized = false;
-        g_origRadarUpdate = nullptr;
+        AbortInstall();
         return false;
     }
 
@@ -1039,21 +1093,8 @@ bool InstallHooks()
 
 void UninstallHooks()
 {
-    if (g_minhookInitialized) {
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-        g_minhookInitialized = false;
-    }
-    g_origRadarUpdate = nullptr;
-    g_origRadarPresentation = nullptr;
-    g_origRadarDemoState = nullptr;
-    g_origGetLocal = nullptr;
-    g_getObserverTarget = nullptr;
-    g_getPlayerSlot = nullptr;
-    g_origFindPlayerBySlot = nullptr;
-    g_spectatorFilterHooked = false;
-    g_radarDemoStateGlobalSlot = 0;
-    g_installed.store(false, std::memory_order_release);
+    DisableInstalledHooks();
+    ResetResolvedRadarState();
     Log("Radar POV: MinHook hooks removed");
 }
 
@@ -1089,17 +1130,6 @@ void RadarPov_SetEnabled(bool enabled)
 bool RadarPov_IsEnabled()
 {
     return g_enabled.load(std::memory_order_relaxed);
-}
-
-void RadarPov_SetAggressiveRedirects(bool enabled)
-{
-    g_aggressiveRedirects.store(enabled, std::memory_order_relaxed);
-    Log("Radar POV: aggressive_redirects=%d (legacy; unused)", enabled ? 1 : 0);
-}
-
-bool RadarPov_AggressiveRedirectsEnabled()
-{
-    return g_aggressiveRedirects.load(std::memory_order_relaxed);
 }
 
 bool RadarPov_Install()

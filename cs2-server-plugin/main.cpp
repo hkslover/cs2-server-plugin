@@ -739,10 +739,6 @@ CON_COMMAND(csdm_radar_pov, "Radar POV (true first-person while spectating): csd
         return;
     }
     const bool enabled = atoi(args.Arg(1)) != 0;
-    // Optional 2nd arg kept for old scripts; ignored for hook selection.
-    if (args.ArgC() >= 3) {
-        RadarPov_SetAggressiveRedirects(atoi(args.Arg(2)) != 0);
-    }
     RadarPov_SetEnabled(enabled);
     if (enabled) {
         if (RadarPov_IsInstalled()) {
