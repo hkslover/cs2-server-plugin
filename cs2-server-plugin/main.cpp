@@ -304,7 +304,7 @@ void LoadSequencesFile(string demoPath) {
 
 void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
 {    
-    if (stage != ClientFrameStage_t::FRAME_START) {
+    if (stage != ClientFrameStage_t::FRAME_RENDER_PASS) {
         originalFrameStageNotify(thisptr, stage);
         return;
     }
@@ -359,9 +359,9 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
         }
     }
 
-    auto demo = engine->GetDemoPlayer();
+    auto demo = engine->GetDemoFile();
     if (demo == NULL) {
-        Log("Demo player interface not found");
+        Log("Demo file interface not found");
         originalFrameStageNotify(thisptr, stage);
         return;
     }
@@ -708,9 +708,9 @@ CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
     engine->GetScreenSize(width, height);
     Log("Screen size: %dx%d", width, height);
 
-    auto demo = engine->GetDemoPlayer();
+    auto demo = engine->GetDemoFile();
     if (demo == NULL) {
-        Log("Demo player interface not found");
+        Log("Demo file interface not found");
         return;
     }
 
