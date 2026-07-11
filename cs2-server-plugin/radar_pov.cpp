@@ -25,7 +25,10 @@ std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_installed{false};
 std::atomic<bool> g_aggressiveRedirects{false};
 
-// Only redirect getLocal while CCSGO_HudRadar is building player icons.
+// Redirect getLocal for the complete CCSGO_HudRadar update. Player icons alone
+// are not enough: radar_mode runs first and chooses the spectator vs. live-POV
+// layout (rotation, player palette, sound pings and death states).
+thread_local int g_inRadarUpdate = 0;
 thread_local int g_inRadarPlayerUpdate = 0;
 // Observer-target *pawn* used as self for this radar tick (same type as getLocal).
 thread_local void* g_povSelfPawn = nullptr;
@@ -160,6 +163,11 @@ bool LooksLikePrologue(const uint8_t* p)
     if (p[0] == 0x41 && (p[1] >= 0x54 && p[1] <= 0x57)) {
         return true;
     }
+    // Some short radar update wrappers begin with `test dl,dl` before saving
+    // registers; accept it only when preceded by a function boundary.
+    if (p[0] == 0x84 && p[1] == 0xD2) {
+        return true;
+    }
     return false;
 }
 
@@ -216,6 +224,7 @@ std::vector<uintptr_t> CollectDirectCalls(uintptr_t fn, size_t maxScan = 0x800)
 
 using RadarModeFn = void(__fastcall*)(void* radar);
 using RadarPlayersFn = void(__fastcall*)(void* radar);
+using RadarUpdateFn = void(__fastcall*)(void* updateContext, uint8_t updateEnabled);
 using GetLocalFn = void*(__fastcall*)();
 // getObs(localPawn) — first insn is mov rcx,[rcx+0x1220] (observer services on pawn).
 using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
@@ -227,6 +236,7 @@ using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 
 RadarModeFn g_origRadarMode = nullptr;
 RadarPlayersFn g_origRadarPlayers = nullptr;
+RadarUpdateFn g_origRadarUpdate = nullptr;
 GetLocalFn g_origGetLocal = nullptr;
 GetObserverTargetFn g_getObserverTarget = nullptr;
 GetPlayerSlotFn g_getPlayerSlot = nullptr;
@@ -409,13 +419,98 @@ void* __fastcall Hook_GetLocal()
         return nullptr;
     }
 
-    if (!g_enabled.load(std::memory_order_relaxed) || g_inRadarPlayerUpdate <= 0 || !g_povActive) {
+    if (!g_enabled.load(std::memory_order_relaxed) ||
+        (g_inRadarUpdate <= 0 && g_inRadarPlayerUpdate <= 0) || !g_povActive) {
         return real;
     }
     if (g_povSelfPawn != nullptr) {
         return g_povSelfPawn;
     }
     return real;
+}
+
+// Resolve the observed pawn once before the outer radar update. All radar
+// sub-systems then obtain the same pawn through Hook_GetLocal.
+void PreparePovContext()
+{
+    g_povSelfPawn = nullptr;
+    g_povActive = false;
+    g_spectatorSlot = -1;
+
+    if (g_origGetLocal == nullptr || g_getObserverTarget == nullptr) {
+        return;
+    }
+
+    void* realPawn = nullptr;
+    __try {
+        realPawn = g_origGetLocal();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        realPawn = nullptr;
+    }
+    void* povPawn = ResolvePovSelfPawn(realPawn);
+    if (povPawn == nullptr) {
+        if (g_logPovFail.fetch_add(1) == 0) {
+            Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p", realPawn);
+        }
+        return;
+    }
+
+    g_povSelfPawn = povPawn;
+    g_povActive = true;
+    if (g_getPlayerSlot != nullptr) {
+        int spectatorSlot = -1;
+        int povSlot = -1;
+        __try {
+            g_getPlayerSlot(realPawn, &spectatorSlot);
+            g_getPlayerSlot(povPawn, &povSlot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            spectatorSlot = -1;
+        }
+        if (spectatorSlot >= 0 && spectatorSlot != povSlot) {
+            g_spectatorSlot = spectatorSlot;
+        }
+    }
+    if (g_logPovOk.fetch_add(1) == 0) {
+        Log("Radar POV: active — self pawn %p -> observed pawn %p (full radar context)",
+            realPawn, povPawn);
+    }
+}
+
+void ClearPovContext()
+{
+    g_povSelfPawn = nullptr;
+    g_povActive = false;
+    g_spectatorSlot = -1;
+}
+
+// Parent update contains radar_mode, player icons and RadarPlayerSoundSnippet.
+// Keeping the redirect alive for this full call makes all three consume the
+// target pawn, matching the live first-person branch rather than only its FOG.
+void __fastcall Hook_RadarUpdate(void* updateContext, uint8_t updateEnabled)
+{
+    const bool wantPov = g_enabled.load(std::memory_order_relaxed);
+    if (wantPov) {
+        ++g_inRadarUpdate;
+        PreparePovContext();
+    }
+
+    __try {
+        if (g_origRadarUpdate != nullptr) {
+            g_origRadarUpdate(updateContext, updateEnabled);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_faultRadarPlayers.fetch_add(1) == 0) {
+            Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08lX) context=%p",
+                GetExceptionCode(), updateContext);
+        }
+    }
+
+    if (wantPov) {
+        if (g_inRadarUpdate > 0) {
+            --g_inRadarUpdate;
+        }
+        ClearPovContext();
+    }
 }
 
 // Make the demo-only spectator slot look absent to the radar's normal player
@@ -436,55 +531,21 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
 void __fastcall Hook_RadarPlayers(void* radar)
 {
     const bool wantPov = g_enabled.load(std::memory_order_relaxed);
-    g_povSelfPawn = nullptr;
-    g_povActive = false;
-    g_spectatorSlot = -1;
+    // Fallback for a future client build where the outer-update signature did
+    // not resolve. Current builds enter with g_inRadarUpdate already set.
+    const bool ownsPovContext = wantPov && g_inRadarUpdate <= 0;
 
     if (wantPov) {
         ++g_inRadarPlayerUpdate;
     }
 
     __try {
-        // Resolve POV *before* the engine update, using the real getLocal pawn.
-        if (wantPov && g_origGetLocal != nullptr && g_getObserverTarget != nullptr) {
-            void* realPawn = nullptr;
-            __try {
-                realPawn = g_origGetLocal();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                realPawn = nullptr;
-            }
-            void* povPawn = ResolvePovSelfPawn(realPawn);
-            if (povPawn != nullptr) {
-                g_povSelfPawn = povPawn;
-                g_povActive = true;
-                SetShowAllFlag(radar, false);
-                if (g_getPlayerSlot != nullptr) {
-                    int spectatorSlot = -1;
-                    int povSlot = -1;
-                    __try {
-                        g_getPlayerSlot(realPawn, &spectatorSlot);
-                        g_getPlayerSlot(povPawn, &povSlot);
-                    } __except (EXCEPTION_EXECUTE_HANDLER) {
-                        spectatorSlot = -1;
-                    }
-                    // A normal live client has one pawn. In demo spectating,
-                    // only hide the distinct, extra spectator slot.
-                    if (spectatorSlot >= 0 && spectatorSlot != povSlot) {
-                        g_spectatorSlot = spectatorSlot;
-                    }
-                }
-                if (g_logPovOk.fetch_add(1) == 0) {
-                    Log("Radar POV: active — self pawn %p -> observed pawn %p (show-all cleared)",
-                        realPawn, povPawn);
-                }
-            } else {
-                // Fail-safe: keep/force show-all so the radar is not empty.
-                SetShowAllFlag(radar, true);
-                if (g_logPovFail.fetch_add(1) == 0) {
-                    Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p",
-                        realPawn);
-                }
-            }
+        if (ownsPovContext) {
+            PreparePovContext();
+        }
+        if (wantPov) {
+            // Keep the previous fail-safe semantics if there is no observed pawn.
+            SetShowAllFlag(radar, !g_povActive);
         }
 
         if (g_origRadarPlayers != nullptr) {
@@ -518,9 +579,9 @@ void __fastcall Hook_RadarPlayers(void* radar)
     if (wantPov && g_inRadarPlayerUpdate > 0) {
         --g_inRadarPlayerUpdate;
     }
-    g_povSelfPawn = nullptr;
-    g_povActive = false;
-    g_spectatorSlot = -1;
+    if (ownsPovContext) {
+        ClearPovContext();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +732,17 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     if (radarModeFn == 0 || modeCallSite == 0) {
         Log("Radar POV: radar mode function not found");
         return false;
+    }
+
+    // The direct caller runs radar_mode, player updates and sound snippets as
+    // one HUD frame. Its first argument is an update wrapper and its second
+    // argument is the `test dl,dl` flag seen at the function entry.
+    const uintptr_t radarUpdateFn = FindFunctionStart(client, modeCallSite);
+    if (radarUpdateFn == 0 || radarUpdateFn == radarModeFn) {
+        Log("Radar POV: full radar update function not found; using player-only fallback");
+    } else {
+        Log("Radar POV: full radar update fn @ %p size=0x%zx", reinterpret_cast<void*>(radarUpdateFn),
+            ApproxFnSize(radarUpdateFn));
     }
 
     uintptr_t radarPlayersFn = 0;
@@ -825,6 +897,9 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
 
     g_origRadarMode = reinterpret_cast<RadarModeFn>(radarModeFn);
     g_origRadarPlayers = reinterpret_cast<RadarPlayersFn>(radarPlayersFn);
+    g_origRadarUpdate =
+        radarUpdateFn != 0 && radarUpdateFn != radarModeFn ? reinterpret_cast<RadarUpdateFn>(radarUpdateFn)
+                                                           : nullptr;
     g_origGetLocal = getLocalFn != 0 ? reinterpret_cast<GetLocalFn>(getLocalFn) : nullptr;
     g_getObserverTarget = getObsFn != 0 ? reinterpret_cast<GetObserverTargetFn>(getObsFn) : nullptr;
     g_getPlayerSlot =
@@ -857,6 +932,7 @@ bool InstallHooks()
 
     void* modeTarget = reinterpret_cast<void*>(g_origRadarMode);
     void* playersTarget = reinterpret_cast<void*>(g_origRadarPlayers);
+    void* updateTarget = reinterpret_cast<void*>(g_origRadarUpdate);
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
     void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
 
@@ -865,6 +941,16 @@ bool InstallHooks()
         MH_Uninitialize();
         g_minhookInitialized = false;
         return false;
+    }
+
+    if (updateTarget != nullptr) {
+        if (!CreateAndEnableHook(updateTarget, reinterpret_cast<void*>(&Hook_RadarUpdate),
+                                 reinterpret_cast<void**>(&g_origRadarUpdate), "radar_update")) {
+            Log("Radar POV: full radar context hook unavailable; using player-only fallback");
+            g_origRadarUpdate = reinterpret_cast<RadarUpdateFn>(updateTarget);
+        }
+    } else {
+        Log("Radar POV: full radar context unresolved; using player-only fallback");
     }
 
     if (!CreateAndEnableHook(playersTarget, reinterpret_cast<void*>(&Hook_RadarPlayers),
@@ -899,9 +985,10 @@ bool InstallHooks()
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
+        g_origRadarUpdate != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0,
         g_getObserverTarget != nullptr ? 1 : 0,
         g_origFindPlayerBySlot != nullptr && g_getPlayerSlot != nullptr ? 1 : 0);
@@ -917,6 +1004,7 @@ void UninstallHooks()
     }
     g_origRadarMode = nullptr;
     g_origRadarPlayers = nullptr;
+    g_origRadarUpdate = nullptr;
     g_origGetLocal = nullptr;
     g_getObserverTarget = nullptr;
     g_getPlayerSlot = nullptr;

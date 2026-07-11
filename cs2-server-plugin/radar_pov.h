@@ -7,8 +7,9 @@
 // NOT a controller. Team / slot / isEnemy / spotted all run on that pawn.
 //
 // While spectating, getLocal is the spectator pawn, so after show-all is off
-// almost nobody is visible. Fix: during the radar player-icon update only,
-// make getLocal return the *observer target pawn* (same type as live 1P self).
+// almost nobody is visible and radar_mode keeps spectator presentation. Fix:
+// during the complete radar update, make getLocal return the *observer target
+// pawn* (same type as live 1P self), including layout, sounds and icon state.
 //
 // If POV cannot be resolved, fall back to engine show-all so the radar is never
 // empty. Never pass a controller into pawn APIs (that AV'd Hook_RadarPlayers).
