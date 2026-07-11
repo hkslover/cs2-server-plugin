@@ -27,10 +27,13 @@ current proven control points and the validation contract.
 
 ## Reverse-engineer the native path
 
-Use the local Ghidra bridge when available:
+Use Ghidra and its bridge when available. First use a bridge path explicitly
+provided by the user. Otherwise, search the current workspace for the bridge
+script or an existing Ghidra MCP configuration; do not assume a fixed folder
+layout or start a second bridge when one is already running. Once available,
+use its endpoint to inspect the current `client.dll`, for example:
 
 ```sh
-python3 ../../ghidramcp/GhidraMCP-release-1-4/bridge_mcp_ghidra.py
 curl 'http://127.0.0.1:8080/decompile_function?address=0x180e25550'
 ```
 
