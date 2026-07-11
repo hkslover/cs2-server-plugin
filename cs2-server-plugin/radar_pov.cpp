@@ -1,9 +1,10 @@
 #include "radar_pov.h"
 
 #include <atomic>
+#include <climits>
 #include <cstdarg>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -237,85 +238,143 @@ void WriteAbsJmp(void* at, void* to)
     *reinterpret_cast<void**>(p + 6) = to;
 }
 
-// Steal at least kAbsJmpSize bytes using a tiny fixed-length decoder for
-// common prologue instructions only. Returns 0 on failure.
+// Length of one common x64 prologue instruction. Returns 0 if unknown.
+// Handles the MSVC prologues seen in CCSGO_HudRadar helpers (mov [rsp+x],
+// push, sub rsp, mov reg, call rel32, call [reg+imm], lea, etc.).
+size_t InsnLenPrologue(const uint8_t* i)
+{
+    if (i == nullptr) {
+        return 0;
+    }
+
+    // push/pop r64
+    if (i[0] >= 0x50 && i[0] <= 0x5F) {
+        return 1;
+    }
+    // REX.B push/pop r8-r15: 41 5x
+    if (i[0] == 0x41 && i[1] >= 0x50 && i[1] <= 0x5F) {
+        return 2;
+    }
+    // REX push/pop: 40 5x (e.g. 40 53 push rbx)
+    if (i[0] == 0x40 && i[1] >= 0x50 && i[1] <= 0x5F) {
+        return 2;
+    }
+    // sub/add/cmp/and rsp, imm8: 48 83 /5 EC xx  (also /0-/7)
+    if (i[0] == 0x48 && i[1] == 0x83) {
+        return 4;
+    }
+    // sub rsp, imm32: 48 81 EC xx xx xx xx
+    if (i[0] == 0x48 && i[1] == 0x81) {
+        return 7;
+    }
+    // mov r/m64, r64  or  mov r64, r/m64  with REX.W: 48 89 / 48 8B
+    // lea r64, m: 48 8D
+    if (i[0] == 0x48 && (i[1] == 0x89 || i[1] == 0x8B || i[1] == 0x8D || i[1] == 0x85 ||
+                         i[1] == 0x87 || i[1] == 0x3B || i[1] == 0x39)) {
+        const uint8_t modrm = i[2];
+        const uint8_t mod = modrm >> 6;
+        const uint8_t rm = modrm & 7;
+        size_t len = 3; // rex + opcode + modrm
+        if (mod != 3 && rm == 4) {
+            len += 1; // SIB
+        }
+        if (mod == 1) {
+            len += 1; // disp8
+        } else if (mod == 2) {
+            len += 4; // disp32
+        } else if (mod == 0 && rm == 5) {
+            len += 4; // rip-relative disp32
+        } else if (mod == 0 && rm == 4) {
+            // SIB with mod=0: if base==5, disp32 follows SIB
+            const uint8_t sib = i[3];
+            if ((sib & 7) == 5) {
+                len += 4;
+            }
+        }
+        return len;
+    }
+    // non-REX mov r32, r/m32: 8B / 89
+    if (i[0] == 0x8B || i[0] == 0x89) {
+        const uint8_t modrm = i[1];
+        const uint8_t mod = modrm >> 6;
+        const uint8_t rm = modrm & 7;
+        size_t len = 2;
+        if (mod != 3 && rm == 4) {
+            len += 1;
+        }
+        if (mod == 1) {
+            len += 1;
+        } else if (mod == 2 || (mod == 0 && rm == 5)) {
+            len += 4;
+        }
+        return len;
+    }
+    // xor/test reg,reg short forms
+    if ((i[0] == 0x33 || i[0] == 0x85 || i[0] == 0x3B) && (i[1] & 0xC0) == 0xC0) {
+        return 2;
+    }
+    if (i[0] == 0x45 && (i[1] == 0x33 || i[1] == 0x85) && (i[2] & 0xC0) == 0xC0) {
+        return 3;
+    }
+    // call rel32 / jmp rel32
+    if (i[0] == 0xE8 || i[0] == 0xE9) {
+        return 5;
+    }
+    // call/jmp r/m64: FF /2 or /4  — e.g. FF 90 78 09 00 00  call [rax+0x978]
+    if (i[0] == 0xFF) {
+        const uint8_t modrm = i[1];
+        const uint8_t reg = (modrm >> 3) & 7;
+        if (reg == 2 || reg == 4) {
+            const uint8_t mod = modrm >> 6;
+            const uint8_t rm = modrm & 7;
+            size_t len = 2;
+            if (mod != 3 && rm == 4) {
+                len += 1;
+            }
+            if (mod == 1) {
+                len += 1;
+            } else if (mod == 2 || (mod == 0 && rm == 5)) {
+                len += 4;
+            }
+            return len;
+        }
+    }
+    // REX.W + FF call [reg+disp]
+    if (i[0] == 0x48 && i[1] == 0xFF) {
+        const uint8_t modrm = i[2];
+        const uint8_t reg = (modrm >> 3) & 7;
+        if (reg == 2 || reg == 4) {
+            const uint8_t mod = modrm >> 6;
+            const uint8_t rm = modrm & 7;
+            size_t len = 3;
+            if (mod != 3 && rm == 4) {
+                len += 1;
+            }
+            if (mod == 1) {
+                len += 1;
+            } else if (mod == 2 || (mod == 0 && rm == 5)) {
+                len += 4;
+            }
+            return len;
+        }
+    }
+    // test al,imm8 / etc. rare in prologue
+    if (i[0] == 0x90) {
+        return 1; // nop
+    }
+    if (i[0] == 0xCC) {
+        return 0;
+    }
+    return 0;
+}
+
+// Steal complete instructions totaling at least kAbsJmpSize bytes.
 size_t MeasureStolenBytes(const uint8_t* p, size_t maxNeed = kAbsJmpSize)
 {
     size_t total = 0;
     while (total < maxNeed && total < 28) {
-        const uint8_t* i = p + total;
-        size_t len = 0;
-
-        // push r64 / pop
-        if (i[0] >= 0x50 && i[0] <= 0x5F) {
-            len = 1;
-        }
-        // REX push/pop r8-r15: 41 5x / 41 5x
-        else if (i[0] == 0x41 && ((i[1] >= 0x50 && i[1] <= 0x5F))) {
-            len = 2;
-        }
-        // REX.W push? rare. 40 53 push rbx etc.
-        else if (i[0] == 0x40 && (i[1] >= 0x50 && i[1] <= 0x5F)) {
-            len = 2;
-        }
-        // sub rsp, imm8: 48 83 EC xx
-        else if (i[0] == 0x48 && i[1] == 0x83 && i[2] == 0xEC) {
-            len = 4;
-        }
-        // sub rsp, imm32: 48 81 EC xx xx xx xx
-        else if (i[0] == 0x48 && i[1] == 0x81 && i[2] == 0xEC) {
-            len = 7;
-        }
-        // mov [rsp+imm8], r64: 48 89 xx 24 xx  (modrm with SIB often)
-        else if (i[0] == 0x48 && i[1] == 0x89) {
-            const uint8_t modrm = i[2];
-            const uint8_t mod = modrm >> 6;
-            const uint8_t rm = modrm & 7;
-            if (mod == 1 && rm == 4) {
-                len = 5; // SIB + disp8
-            } else if (mod == 1) {
-                len = 4;
-            } else if (mod == 2 && rm == 4) {
-                len = 8;
-            } else if (mod == 2) {
-                len = 7;
-            } else if (mod == 3) {
-                len = 3;
-            } else if (mod == 0 && rm == 4) {
-                len = 4; // SIB
-            } else if (mod == 0) {
-                len = 3;
-            }
-        }
-        // mov rax, rsp: 48 8B C4
-        else if (i[0] == 0x48 && i[1] == 0x8B && i[2] == 0xC4) {
-            len = 3;
-        }
-        // mov reg, reg: 48 8B Cx (modrm mod=11)
-        else if (i[0] == 0x48 && i[1] == 0x8B && (i[2] & 0xC0) == 0xC0) {
-            len = 3;
-        }
-        // xor reg, reg: 33 C0 / 45 33 C0 etc.
-        else if (i[0] == 0x33 && (i[1] & 0xC0) == 0xC0) {
-            len = 2;
-        } else if (i[0] == 0x45 && i[1] == 0x33 && (i[2] & 0xC0) == 0xC0) {
-            len = 3;
-        }
-        // test reg, reg
-        else if (i[0] == 0x48 && i[1] == 0x85 && (i[2] & 0xC0) == 0xC0) {
-            len = 3;
-        }
-        // nop
-        else if (i[0] == 0x90) {
-            len = 1;
-        }
-        // int3
-        else if (i[0] == 0xCC) {
-            break;
-        }
-
+        const size_t len = InsnLenPrologue(p + total);
         if (len == 0) {
-            // Unknown opcode — refuse rather than split an instruction.
             return 0;
         }
         total += len;
@@ -323,14 +382,57 @@ size_t MeasureStolenBytes(const uint8_t* p, size_t maxNeed = kAbsJmpSize)
     return total >= maxNeed ? total : 0;
 }
 
+// Copy stolen bytes into trampoline and fix E8/E9 relative displacements so
+// they still target the original absolute destinations.
+bool BuildTrampoline(uint8_t* tramp, const uint8_t* src, size_t stolen, uintptr_t srcAddr)
+{
+    size_t off = 0;
+    while (off < stolen) {
+        const size_t len = InsnLenPrologue(src + off);
+        if (len == 0 || off + len > stolen) {
+            return false;
+        }
+        memcpy(tramp + off, src + off, len);
+        // Relocate relative call/jmp.
+        if ((src[off] == 0xE8 || src[off] == 0xE9) && len == 5) {
+            const int32_t oldRel = *reinterpret_cast<const int32_t*>(src + off + 1);
+            const uintptr_t absTarget = srcAddr + off + 5 + static_cast<intptr_t>(oldRel);
+            const uintptr_t newFrom = reinterpret_cast<uintptr_t>(tramp) + off + 5;
+            const int64_t newRel64 = static_cast<int64_t>(absTarget - newFrom);
+            if (newRel64 < INT32_MIN || newRel64 > INT32_MAX) {
+                return false;
+            }
+            *reinterpret_cast<int32_t*>(tramp + off + 1) = static_cast<int32_t>(newRel64);
+        }
+        // RIP-relative lea/mov with modrm rm=5 mod=0 (after optional REX).
+        // 48 8D/8B 05 xx xx xx xx
+        if (len >= 7 && src[off] == 0x48 &&
+            (src[off + 1] == 0x8D || src[off + 1] == 0x8B || src[off + 1] == 0x89) &&
+            (src[off + 2] & 0xC7) == 0x05) {
+            const int32_t oldRel = *reinterpret_cast<const int32_t*>(src + off + 3);
+            const uintptr_t absTarget = srcAddr + off + 7 + static_cast<intptr_t>(oldRel);
+            const uintptr_t newFrom = reinterpret_cast<uintptr_t>(tramp) + off + 7;
+            const int64_t newRel64 = static_cast<int64_t>(absTarget - newFrom);
+            if (newRel64 < INT32_MIN || newRel64 > INT32_MAX) {
+                return false;
+            }
+            *reinterpret_cast<int32_t*>(tramp + off + 3) = static_cast<int32_t>(newRel64);
+        }
+        off += len;
+    }
+    return off == stolen;
+}
+
 bool InstallInlineHook(InlineHook& hook, void* target, void* detour)
 {
     if (target == nullptr || detour == nullptr) {
         return false;
     }
-    const size_t stolen = MeasureStolenBytes(static_cast<const uint8_t*>(target));
+    const auto* bytes = static_cast<const uint8_t*>(target);
+    const size_t stolen = MeasureStolenBytes(bytes);
     if (stolen < kAbsJmpSize) {
-        Log("Radar POV: cannot measure safe prologue at %p (stolen=%zu)", target, stolen);
+        Log("Radar POV: cannot measure safe prologue at %p (stolen=%zu) bytes=%02x %02x %02x %02x %02x %02x %02x %02x",
+            target, stolen, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
         return false;
     }
 
@@ -341,8 +443,12 @@ bool InstallInlineHook(InlineHook& hook, void* target, void* detour)
     }
 
     memcpy(hook.original, target, stolen);
-    // trampoline: original bytes + abs jmp back to target+stolen
-    memcpy(tramp, target, stolen);
+    if (!BuildTrampoline(static_cast<uint8_t*>(tramp), bytes, stolen,
+                         reinterpret_cast<uintptr_t>(target))) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        Log("Radar POV: trampoline relocate failed at %p stolen=%zu", target, stolen);
+        return false;
+    }
     WriteAbsJmp(static_cast<uint8_t*>(tramp) + stolen, static_cast<uint8_t*>(target) + stolen);
 
     DWORD oldProt = 0;
@@ -352,7 +458,6 @@ bool InstallInlineHook(InlineHook& hook, void* target, void* detour)
         return false;
     }
     WriteAbsJmp(target, detour);
-    // NOP the rest of the stolen region so we don't leave partial ops.
     if (stolen > kAbsJmpSize) {
         memset(static_cast<uint8_t*>(target) + kAbsJmpSize, 0x90, stolen - kAbsJmpSize);
     }
@@ -364,6 +469,7 @@ bool InstallInlineHook(InlineHook& hook, void* target, void* detour)
     hook.trampoline = tramp;
     hook.stolen = stolen;
     hook.active = true;
+    Log("Radar POV: hooked %p -> %p (stolen=%zu tramp=%p)", target, detour, stolen, tramp);
     return true;
 }
 
