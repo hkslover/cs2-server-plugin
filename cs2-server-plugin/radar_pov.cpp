@@ -46,6 +46,7 @@ std::atomic<int> g_logPresentationOverride{0};
 std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logIsSpecCheckCalls{0};
 std::atomic<int> g_logGetEntityBySlot{0};
+std::atomic<int> g_logIconTypeFix{0};
 
 void Log(const char* fmt, ...)
 {
@@ -261,6 +262,8 @@ using IsSpectatorCheckFn = uint8_t(__fastcall*)(void* entity);
 // Controller lookup by player slot: FUN_180926920.  Icon colour path calls this
 // with slot 0 (hardcoded) as "local" — in demos that is the spectator controller.
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
+// FUN_180e39320(icon, playerTeam): selects radar icon panel type (stored at +0x16c).
+using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
 RadarPresentationFn g_origRadarPresentation = nullptr;
@@ -271,11 +274,23 @@ GetPlayerSlotFn g_getPlayerSlot = nullptr;
 FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 IsSpectatorCheckFn g_origIsSpectatorCheck = nullptr;
 GetEntityBySlotFn g_origGetEntityBySlot = nullptr;
+SetRadarIconTypeFn g_origSetRadarIconType = nullptr;
 
 bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
 bool g_getEntityBySlotHooked = false;
+bool g_iconTypeHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
+
+// Icon type field written by FUN_180e39320 / read by FUN_180e460e0 colour paint.
+constexpr ptrdiff_t kIconTypeOffset = 0x16c;
+// Live-FOG teammate icon type (no competitive RGB paint in e460e0).
+constexpr int kIconTypeLiveTeammate = 0x11;
+// Spectator-style types that e460e0 live RGB path actually paints.
+constexpr int kIconTypeTerrorist = 9;
+constexpr int kIconTypeCT = 0xd;
+constexpr int kTeamT = 3;
+constexpr int kTeamCT = 2;
 
 // getLocal validates return with vtable+0x4D8 = IsPlayerPawn (index 155).
 constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
@@ -634,6 +649,46 @@ void* __fastcall Hook_GetEntityBySlot(int slot)
         return g_origGetEntityBySlot(g_povSelfSlot);
     }
     return g_origGetEntityBySlot(slot);
+}
+
+// FUN_180e39320 picks the icon panel type:
+//   spectator / demo  → 9 (T) or 0xD (CT)  — competitive RGB paint works
+//   live teammate     → 0x11               — e460e0 skips RGB (team-coloured panels)
+// Forcing live (IsSpectatorCheck=0, demo=0) therefore yields type 0x11 and team colours
+// even after the colour gate is open.  Map 0x11 back to 9/0xD so the engine's own
+// live competitive colour path in FUN_180e460e0 runs for teammates.
+void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
+{
+    if (g_origSetRadarIconType != nullptr) {
+        g_origSetRadarIconType(icon, playerTeam);
+    }
+    if (!g_enabled.load(std::memory_order_relaxed) || g_inRadarUpdate <= 0 || !g_povActive ||
+        icon == nullptr) {
+        return;
+    }
+    __try {
+        auto* typePtr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(icon) + kIconTypeOffset);
+        const int type = *typePtr;
+        if (type != kIconTypeLiveTeammate) {
+            return;
+        }
+        int fixed = type;
+        if (playerTeam == kTeamT) {
+            fixed = kIconTypeTerrorist;
+        } else if (playerTeam == kTeamCT) {
+            fixed = kIconTypeCT;
+        } else {
+            return;
+        }
+        *typePtr = fixed;
+        const int n = g_logIconTypeFix.fetch_add(1);
+        if (n == 0 || n == 20) {
+            Log("Radar POV: icon type 0x11 -> %d (team %d) for competitive RGB paint", fixed,
+                playerTeam);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // ignore
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1323,74 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
+    // --- locate FUN_180e39320 (SetRadarIconType) ---
+    // Called from radar players after loading the subject's team byte.
+    // Prologue (MSVC may emit REX on push rsi):
+    //   40 56 57 41 56 48 83 EC 20 8B FA 4C 8B F1 E8 <getLocal>
+    {
+        constexpr size_t kCallGetLocalOff = 14;  // offset of E8 getLocal in prologue
+        auto looksLikeSetIconType = [&](uintptr_t fn) -> bool {
+            if (!IsInsideModule(client, fn) || !IsInsideModule(client, fn + 18)) {
+                return false;
+            }
+            const auto* p = reinterpret_cast<const uint8_t*>(fn);
+            // 40 56 57 41 56 48 83 EC 20 8B FA 4C 8B F1 E8
+            return p[0] == 0x40 && p[1] == 0x56 && p[2] == 0x57 && p[3] == 0x41 &&
+                p[4] == 0x56 && p[5] == 0x48 && p[6] == 0x83 && p[7] == 0xEC &&
+                p[8] == 0x20 && p[9] == 0x8B && p[10] == 0xFA && p[11] == 0x4C &&
+                p[12] == 0x8B && p[13] == 0xF1 && p[14] == 0xE8;
+        };
+
+        if (radarPlayersFn != 0 && g_origGetLocal != nullptr) {
+            const auto* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
+            const size_t bodySize = ApproxFnSize(radarPlayersFn);
+            const uintptr_t getLocal = reinterpret_cast<uintptr_t>(g_origGetLocal);
+            for (size_t i = 0; i + 5 < bodySize; ++i) {
+                uintptr_t target = 0;
+                if (!DecodeRel32Call(body + i, radarPlayersFn + i, target)) {
+                    continue;
+                }
+                if (!looksLikeSetIconType(target)) {
+                    continue;
+                }
+                uintptr_t firstCall = 0;
+                const auto* cand = reinterpret_cast<const uint8_t*>(target);
+                if (DecodeRel32Call(cand + kCallGetLocalOff, target + kCallGetLocalOff, firstCall) &&
+                    firstCall == getLocal) {
+                    g_origSetRadarIconType = reinterpret_cast<SetRadarIconTypeFn>(target);
+                    Log("Radar POV: SetRadarIconType @ %p (radar-players + getLocal prologue)",
+                        reinterpret_cast<void*>(target));
+                    break;
+                }
+            }
+        }
+
+        if (g_origSetRadarIconType == nullptr && client.base != nullptr) {
+            for (size_t i = 0; i + 19 <= client.size; ++i) {
+                const uintptr_t addr = reinterpret_cast<uintptr_t>(client.base + i);
+                if (!looksLikeSetIconType(addr)) {
+                    continue;
+                }
+                if (g_origGetLocal != nullptr) {
+                    uintptr_t firstCall = 0;
+                    if (!DecodeRel32Call(client.base + i + kCallGetLocalOff, addr + kCallGetLocalOff,
+                                         firstCall) ||
+                        firstCall != reinterpret_cast<uintptr_t>(g_origGetLocal)) {
+                        continue;
+                    }
+                }
+                g_origSetRadarIconType = reinterpret_cast<SetRadarIconTypeFn>(addr);
+                Log("Radar POV: SetRadarIconType @ %p (prologue + getLocal)",
+                    reinterpret_cast<void*>(addr));
+                break;
+            }
+        }
+
+        if (g_origSetRadarIconType == nullptr) {
+            Log("Radar POV: SetRadarIconType not found; live teammate type 0x11 may block RGB colours");
+        }
+    }
+
     return true;
 }
 
@@ -1282,8 +1405,10 @@ void ResetResolvedRadarState()
     g_origFindPlayerBySlot = nullptr;
     g_origIsSpectatorCheck = nullptr;
     g_origGetEntityBySlot = nullptr;
+    g_origSetRadarIconType = nullptr;
     g_spectatorFilterHooked = false;
     g_getEntityBySlotHooked = false;
+    g_iconTypeHooked = false;
     g_radarDemoStateGlobalSlot = 0;
     g_radarShowAllFlagOffset = 0;
     g_installed.store(false, std::memory_order_release);
@@ -1416,8 +1541,23 @@ bool InstallHooks()
         Log("Radar POV: GetEntityBySlot unresolved; live colour paint may skip teammates");
     }
 
+    // Map live teammate icon type 0x11 → 9/0xD so e460e0 competitive RGB runs.
+    if (g_origSetRadarIconType != nullptr) {
+        if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origSetRadarIconType),
+                                 reinterpret_cast<void*>(&Hook_SetRadarIconType),
+                                 reinterpret_cast<void**>(&g_origSetRadarIconType),
+                                 "setRadarIconType")) {
+            Log("Radar POV: SetRadarIconType hook failed; type 0x11 may block RGB colours");
+            g_origSetRadarIconType = nullptr;
+        } else {
+            g_iconTypeHooked = true;
+        }
+    } else {
+        Log("Radar POV: SetRadarIconType unresolved; type 0x11 may block RGB colours");
+    }
+
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d getEntityBySlot=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d getEntityBySlot=%d iconType=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origRadarUpdate != nullptr ? 1 : 0,
@@ -1427,7 +1567,8 @@ bool InstallHooks()
         g_getObserverTarget != nullptr ? 1 : 0,
         g_spectatorFilterHooked ? 1 : 0,
         g_origIsSpectatorCheck != nullptr ? 1 : 0,
-        g_getEntityBySlotHooked ? 1 : 0);
+        g_getEntityBySlotHooked ? 1 : 0,
+        g_iconTypeHooked ? 1 : 0);
     return true;
 }
 
