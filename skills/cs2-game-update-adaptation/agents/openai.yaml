@@ -1,0 +1,4 @@
+interface:
+  display_name: "CS2 Plugin Update"
+  short_description: "Adapt server-plugin to CS2 updates"
+  default_prompt: "Update cs2-server-plugin for the latest CS2 interface changes."
