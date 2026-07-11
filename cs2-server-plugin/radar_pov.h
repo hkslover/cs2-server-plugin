@@ -2,11 +2,9 @@
 
 // First-person radar simulation for CS2 demo spectating.
 //
-// Upstream-only strategy (Ghidra):
-// Competitive icon body colours are painted in FUN_180e460e0 when:
-//   !IsSpectator(localCtrl) && !demo  AND  icon type is 9/0xD  AND  colour gates pass.
-// Identity hooks open the live branch; icon-type + colour-gate hooks complete the
-// engine's own competitive RGB path. No forced SetColor / ARGB paint.
+// Identity hooks (getLocal, GetEntityBySlot, demo) open the live radar branch.
+// Teammate icon type rewrite + post-e460e0 force ARGB (engine cl_teammate_color_*)
+// complete competitive colours for teammates only.
 //
 // Windows x64 only. Install is best-effort / non-fatal.
 

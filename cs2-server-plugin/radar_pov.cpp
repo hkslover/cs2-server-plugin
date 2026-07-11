@@ -260,10 +260,6 @@ using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
 // FUN_180e39320(icon, playerTeam) — writes icon type at +0x16c.
 using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
-// FUN_180863200(localTeam, iconTeam) — allow competitive colour paint.
-using ShouldApplyCompColorFn = uint8_t(__fastcall*)(int localTeam, int iconTeam);
-// FUN_1808494d0(controller) — m_iCompTeammateColor or -1.
-using GetCompTeammateColorFn = int(__fastcall*)(void* controller);
 // FUN_180e460e0(radar, icon) — icon colour update.
 using RadarIconColorFn = void(__fastcall*)(void* radar, void* icon);
 // FUN_180849370(outArgb, colorIndex) — cl_teammate_color_N ARGB.
@@ -279,8 +275,6 @@ GetPlayerSlotFn g_getPlayerSlot = nullptr;
 FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 GetEntityBySlotFn g_origGetEntityBySlot = nullptr;
 SetRadarIconTypeFn g_origSetRadarIconType = nullptr;
-ShouldApplyCompColorFn g_origShouldApplyCompColor = nullptr;
-GetCompTeammateColorFn g_origGetCompTeammateColor = nullptr;
 RadarIconColorFn g_origRadarIconColor = nullptr;
 GetCompColorArgbFn g_getCompColorArgb = nullptr;
 ResolvePlayerByIndexFn g_resolvePlayerByIndex = nullptr;
@@ -289,7 +283,6 @@ bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
 bool g_getEntityBySlotHooked = false;
 bool g_iconTypeHooked = false;
-bool g_compColorHooks = false;
 bool g_iconColorHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
 
@@ -680,35 +673,6 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // ignore
     }
-}
-
-// FUN_180863200: open competitive-colour gate only for observed player's team.
-uint8_t __fastcall Hook_ShouldApplyCompColor(int localTeam, int iconTeam)
-{
-    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
-        IsPovTeammateTeam(iconTeam)) {
-        return 1;
-    }
-    return g_origShouldApplyCompColor != nullptr ? g_origShouldApplyCompColor(localTeam, iconTeam)
-                                                 : 0;
-}
-
-// FUN_1808494d0: return m_iCompTeammateColor without game-rules/mode veto.
-int __fastcall Hook_GetCompTeammateColor(void* controller)
-{
-    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
-        controller != nullptr) {
-        __try {
-            const int c = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(controller) +
-                                                   kCompTeammateColorOffset);
-            if (c >= 0 && c <= 4) {
-                return c;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // fall through
-        }
-    }
-    return g_origGetCompTeammateColor != nullptr ? g_origGetCompTeammateColor(controller) : -1;
 }
 
 bool SetIconPanelColor(void* icon, ptrdiff_t panelOff, uint32_t* argb)
@@ -1320,46 +1284,6 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
-    // FUN_180863200
-    {
-        const uint8_t kPat[] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20,
-                                0x8B, 0xFA, 0x8B, 0xD9, 0xBA, 0xFF, 0xFF, 0xFF, 0xFF, 0x48,
-                                0x8D, 0x0D};
-        const uint8_t* hit = FindBytes(client.base, client.size, kPat, sizeof(kPat));
-        if (hit != nullptr) {
-            g_origShouldApplyCompColor =
-                reinterpret_cast<ShouldApplyCompColorFn>(reinterpret_cast<uintptr_t>(hit));
-            Log("Radar POV: ShouldApplyCompColor @ %p", hit);
-        }
-    }
-
-    // FUN_1808494d0 — prologue + mov eax,[rbx+0x850]
-    if (client.base != nullptr) {
-        for (size_t i = 0; i + 32 <= client.size; ++i) {
-            const uint8_t* p = client.base + i;
-            if (p[0] != 0x40 || p[1] != 0x53 || p[2] != 0x48 || p[3] != 0x83 || p[4] != 0xEC ||
-                p[5] != 0x20 || p[6] != 0x48 || p[7] != 0x8B || p[8] != 0xD9 || p[9] != 0x48 ||
-                p[10] != 0x8B || p[11] != 0x0D) {
-                continue;
-            }
-            bool has850 = false;
-            for (size_t j = 0; j + 6 < 0x40; ++j) {
-                if (p[j] == 0x8B && p[j + 1] == 0x83 && p[j + 2] == 0x50 && p[j + 3] == 0x08 &&
-                    p[j + 4] == 0x00 && p[j + 5] == 0x00) {
-                    has850 = true;
-                    break;
-                }
-            }
-            if (!has850) {
-                continue;
-            }
-            g_origGetCompTeammateColor =
-                reinterpret_cast<GetCompTeammateColorFn>(reinterpret_cast<uintptr_t>(p));
-            Log("Radar POV: GetCompTeammateColor @ %p", p);
-            break;
-        }
-    }
-
     // FUN_180849370 — cl_teammate_color_N ARGB
     {
         const uint8_t kPat[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
@@ -1472,15 +1396,12 @@ void ResetResolvedRadarState()
     g_origFindPlayerBySlot = nullptr;
     g_origGetEntityBySlot = nullptr;
     g_origSetRadarIconType = nullptr;
-    g_origShouldApplyCompColor = nullptr;
-    g_origGetCompTeammateColor = nullptr;
     g_origRadarIconColor = nullptr;
     g_getCompColorArgb = nullptr;
     g_resolvePlayerByIndex = nullptr;
     g_spectatorFilterHooked = false;
     g_getEntityBySlotHooked = false;
     g_iconTypeHooked = false;
-    g_compColorHooks = false;
     g_iconColorHooked = false;
     g_radarDemoStateGlobalSlot = 0;
     g_radarShowAllFlagOffset = 0;
@@ -1593,23 +1514,6 @@ bool InstallHooks()
         }
     }
 
-    // Colour gates used by FUN_180e460e0 live RGB (no forced SetColor).
-    bool gateOk = false;
-    bool colorOk = false;
-    if (g_origShouldApplyCompColor != nullptr) {
-        gateOk = CreateAndEnableHook(reinterpret_cast<void*>(g_origShouldApplyCompColor),
-                                     reinterpret_cast<void*>(&Hook_ShouldApplyCompColor),
-                                     reinterpret_cast<void**>(&g_origShouldApplyCompColor),
-                                     "shouldApplyCompColor");
-    }
-    if (g_origGetCompTeammateColor != nullptr) {
-        colorOk = CreateAndEnableHook(reinterpret_cast<void*>(g_origGetCompTeammateColor),
-                                      reinterpret_cast<void*>(&Hook_GetCompTeammateColor),
-                                      reinterpret_cast<void**>(&g_origGetCompTeammateColor),
-                                      "getCompTeammateColor");
-    }
-    g_compColorHooks = gateOk && colorOk;
-
     // Force competitive ARGB after native icon colour update (engine palette).
     if (g_origRadarIconColor != nullptr && g_getCompColorArgb != nullptr) {
         if (CreateAndEnableHook(reinterpret_cast<void*>(g_origRadarIconColor),
@@ -1629,12 +1533,11 @@ bool InstallHooks()
 
     g_installed.store(true, std::memory_order_release);
     Log("Radar POV: installed enabled=%d update=%d getLocal=%d getObs=%d demoState=%d "
-        "getEntityBySlot=%d spectatorFilter=%d iconType=%d compColor=%d forceColor=%d",
+        "getEntityBySlot=%d spectatorFilter=%d iconType=%d forceColor=%d",
         g_enabled.load() ? 1 : 0, g_origRadarUpdate != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0, g_getObserverTarget != nullptr ? 1 : 0,
         g_origRadarDemoState != nullptr ? 1 : 0, g_getEntityBySlotHooked ? 1 : 0,
-        g_spectatorFilterHooked ? 1 : 0, g_iconTypeHooked ? 1 : 0, g_compColorHooks ? 1 : 0,
-        g_iconColorHooked ? 1 : 0);
+        g_spectatorFilterHooked ? 1 : 0, g_iconTypeHooked ? 1 : 0, g_iconColorHooked ? 1 : 0);
     return true;
 }
 
