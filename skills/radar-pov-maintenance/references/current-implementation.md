@@ -113,6 +113,20 @@ fallback `playerIndex % 5` if unset; `GetCompColorArgb` → SetColor on panels
 
 Prefer semantic re-resolve over these numbers after an update.
 
+### Pattern API (`radar_pov.cpp`)
+
+AfxHookSource2-style hex strings (same idea as `Afx::BinUtils::FindPatternString`):
+
+```cpp
+FindPattern(base, size, "48 8B 0D ?? ?? ?? ?? FF 90 B0 02 00 00");
+MatchPattern(addr, avail, "40 56 57 41 56 48 83 EC 20 ...");
+FindPatternAll(base, size, pattern, maxHits);
+```
+
+- `??` = wildcard byte; spaces separate bytes.
+- Prefer short structural patterns + call-chain checks over long fixed prologue masks.
+- Linear scan is fine for one-shot install (module-sized); no need for SIMD scanners.
+
 ## Healthy log (success baseline)
 
 ```text

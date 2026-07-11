@@ -104,6 +104,155 @@ uint32_t GetPeTimestamp(const ModuleInfo& mod)
     return nt->FileHeader.TimeDateStamp;
 }
 
+// ---------------------------------------------------------------------------
+// Pattern scan (AfxHookSource2-style hex strings with ?? wildcards)
+// e.g. "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 B0 02 00 00"
+// ---------------------------------------------------------------------------
+
+struct PatternByte {
+    uint8_t value = 0;
+    uint8_t mask = 0;  // 0xFF = compare, 0x00 = wildcard
+};
+
+bool ParseHexDigit(char c, uint8_t& out)
+{
+    if (c >= '0' && c <= '9') {
+        out = static_cast<uint8_t>(c - '0');
+        return true;
+    }
+    if (c >= 'a' && c <= 'f') {
+        out = static_cast<uint8_t>(c - 'a' + 10);
+        return true;
+    }
+    if (c >= 'A' && c <= 'F') {
+        out = static_cast<uint8_t>(c - 'A' + 10);
+        return true;
+    }
+    return false;
+}
+
+// Returns false if the pattern string is empty or malformed.
+bool ParsePattern(const char* hex, std::vector<PatternByte>& out)
+{
+    out.clear();
+    if (hex == nullptr) {
+        return false;
+    }
+    size_t i = 0;
+    while (hex[i] != '\0') {
+        while (hex[i] == ' ' || hex[i] == '\t') {
+            ++i;
+        }
+        if (hex[i] == '\0') {
+            break;
+        }
+        const char c0 = hex[i++];
+        char c1 = 0;
+        if (hex[i] != '\0' && hex[i] != ' ' && hex[i] != '\t') {
+            c1 = hex[i++];
+        } else {
+            // Single nibble is invalid unless '?'
+            if (c0 != '?') {
+                out.clear();
+                return false;
+            }
+            c1 = '?';
+        }
+        PatternByte pb = {};
+        if (c0 == '?' && (c1 == '?' || c1 == 0)) {
+            pb.value = 0;
+            pb.mask = 0;
+        } else {
+            uint8_t hi = 0;
+            uint8_t lo = 0;
+            if (c0 == '?') {
+                pb.mask = 0x0F;
+                if (!ParseHexDigit(c1, lo)) {
+                    out.clear();
+                    return false;
+                }
+                pb.value = lo;
+            } else if (c1 == '?') {
+                pb.mask = 0xF0;
+                if (!ParseHexDigit(c0, hi)) {
+                    out.clear();
+                    return false;
+                }
+                pb.value = static_cast<uint8_t>(hi << 4);
+            } else {
+                if (!ParseHexDigit(c0, hi) || !ParseHexDigit(c1, lo)) {
+                    out.clear();
+                    return false;
+                }
+                pb.value = static_cast<uint8_t>((hi << 4) | lo);
+                pb.mask = 0xFF;
+            }
+        }
+        out.push_back(pb);
+    }
+    return !out.empty();
+}
+
+bool MatchPatternAt(const uint8_t* p, const std::vector<PatternByte>& pat)
+{
+    if (p == nullptr || pat.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < pat.size(); ++i) {
+        if (pat[i].mask == 0) {
+            continue;
+        }
+        if ((p[i] & pat[i].mask) != (pat[i].value & pat[i].mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MatchPattern(const uint8_t* p, size_t avail, const char* hex)
+{
+    std::vector<PatternByte> pat;
+    if (!ParsePattern(hex, pat) || avail < pat.size()) {
+        return false;
+    }
+    return MatchPatternAt(p, pat);
+}
+
+// First hit in [begin, begin+size). nullptr if none.
+const uint8_t* FindPattern(const uint8_t* begin, size_t size, const char* hex)
+{
+    std::vector<PatternByte> pat;
+    if (!ParsePattern(hex, pat) || begin == nullptr || size < pat.size()) {
+        return nullptr;
+    }
+    const size_t plen = pat.size();
+    const uint8_t* end = begin + size - plen;
+    for (const uint8_t* p = begin; p <= end; ++p) {
+        if (MatchPatternAt(p, pat)) {
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<const uint8_t*> FindPatternAll(const uint8_t* begin, size_t size, const char* hex,
+                                           size_t maxHits = 32)
+{
+    std::vector<const uint8_t*> hits;
+    std::vector<PatternByte> pat;
+    if (!ParsePattern(hex, pat) || begin == nullptr || size < pat.size()) {
+        return hits;
+    }
+    const size_t plen = pat.size();
+    const uint8_t* end = begin + size - plen;
+    for (const uint8_t* p = begin; p <= end && hits.size() < maxHits; ++p) {
+        if (MatchPatternAt(p, pat)) {
+            hits.push_back(p);
+        }
+    }
+    return hits;
+}
+
 const uint8_t* FindBytes(const uint8_t* begin, size_t size, const void* needle, size_t needleSize)
 {
     if (begin == nullptr || needle == nullptr || needleSize == 0 || size < needleSize) {
@@ -969,13 +1118,11 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         return false;
     }
 
-    for (size_t i = 0; i + 7 <= ApproxFnSize(radarModeFn); ++i) {
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(radarModeFn + i);
-        if (b[0] == 0x80 && b[1] == 0xA3 && b[6] == 0xFE) {
-            g_radarShowAllFlagOffset =
-                static_cast<ptrdiff_t>(*reinterpret_cast<const uint32_t*>(b + 2));
-            break;
-        }
+    // and byte ptr [radar+disp32], 0FEh
+    if (const uint8_t* hit = FindPattern(reinterpret_cast<const uint8_t*>(radarModeFn),
+                                         ApproxFnSize(radarModeFn), "80 A3 ?? ?? ?? ?? FE")) {
+        g_radarShowAllFlagOffset =
+            static_cast<ptrdiff_t>(*reinterpret_cast<const uint32_t*>(hit + 2));
     }
     if (g_radarShowAllFlagOffset <= 0) {
         Log("Radar POV: show-all flag offset not found");
@@ -985,8 +1132,9 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
 
     const uintptr_t radarUpdateFn = FindFunctionStart(client, modeCallSite);
     const auto* updateBytes = reinterpret_cast<const uint8_t*>(radarUpdateFn);
+    // test dl,dl ... lea rsi,[rcx-20h] at +0x23
     const bool validRadarUpdate = radarUpdateFn != 0 && radarUpdateFn != radarModeFn &&
-        updateBytes[0] == 0x84 && updateBytes[1] == 0xD2 && updateBytes[0x23] == 0x48 &&
+        MatchPattern(updateBytes, 0x30, "84 D2") && updateBytes[0x23] == 0x48 &&
         updateBytes[0x24] == 0x8D && updateBytes[0x25] == 0x71 && updateBytes[0x26] == 0xE0;
     if (!validRadarUpdate) {
         Log("Radar POV: full radar update wrapper shape not recognized");
@@ -995,19 +1143,15 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     Log("Radar POV: full radar update fn @ %p size=0x%zx", reinterpret_cast<void*>(radarUpdateFn),
         ApproxFnSize(radarUpdateFn));
 
-    // demo/HLTV: mov rcx,[rip+global]; mov rax,[rcx]; call [rax+2B0h]
-    for (size_t i = 0; i + 15 < ApproxFnSize(radarModeFn); ++i) {
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(radarModeFn + i);
-        if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B ||
-            b[9] != 0x01 || b[10] != 0xFF || b[11] != 0x90 || b[12] != 0xB0 || b[13] != 0x02 ||
-            b[14] != 0x00 || b[15] != 0x00) {
-            continue;
-        }
-        const int32_t rel = *reinterpret_cast<const int32_t*>(b + 3);
-        const uintptr_t slot = radarModeFn + i + 7 + static_cast<intptr_t>(rel);
+    // mov rcx,[rip+global]; mov rax,[rcx]; call [rax+2B0h]
+    if (const uint8_t* hit =
+            FindPattern(reinterpret_cast<const uint8_t*>(radarModeFn), ApproxFnSize(radarModeFn),
+                        "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 B0 02 00 00")) {
+        const int32_t rel = *reinterpret_cast<const int32_t*>(hit + 3);
+        const size_t off = static_cast<size_t>(hit - reinterpret_cast<const uint8_t*>(radarModeFn));
+        const uintptr_t slot = radarModeFn + off + 7 + static_cast<intptr_t>(rel);
         if (IsInsideModule(client, slot)) {
             g_radarDemoStateGlobalSlot = slot;
-            break;
         }
     }
     if (g_radarDemoStateGlobalSlot == 0) {
@@ -1105,32 +1249,27 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     }
 
     {
+        // lea rdx,[rsp+24h]; mov rcx,rax; call getSlot
         const uint8_t* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
         const size_t bodySize = ApproxFnSize(radarPlayersFn);
-        for (size_t i = 0; i + 13 < bodySize && i < 0x100; ++i) {
-            if (body[i] != 0x48 || body[i + 1] != 0x8D || body[i + 2] != 0x54 ||
-                body[i + 3] != 0x24 || body[i + 4] != 0x24 || body[i + 5] != 0x48 ||
-                body[i + 6] != 0x8B || body[i + 7] != 0xC8 || body[i + 8] != 0xE8) {
-                continue;
-            }
-            DecodeRel32Call(body + i + 8, radarPlayersFn + i + 8, getPlayerSlotFn);
-            break;
+        const size_t scan = bodySize < 0x100 ? bodySize : 0x100;
+        const uint8_t* hit =
+            FindPattern(body, scan, "48 8D 54 24 24 48 8B C8 E8");
+        if (hit != nullptr) {
+            DecodeRel32Call(hit + 8, radarPlayersFn + static_cast<size_t>(hit - body) + 8,
+                            getPlayerSlotFn);
         }
     }
 
     {
+        // mov ecx,edi; call findPlayerBySlot; mov [rsp+58h],rax; mov rbx,rax; test rax,rax
         const uint8_t* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
         const size_t bodySize = ApproxFnSize(radarPlayersFn);
-        for (size_t i = 0; i + 18 < bodySize; ++i) {
-            if (body[i] != 0x8B || body[i + 1] != 0xCF || body[i + 2] != 0xE8 ||
-                body[i + 7] != 0x48 || body[i + 8] != 0x89 || body[i + 9] != 0x44 ||
-                body[i + 10] != 0x24 || body[i + 11] != 0x58 || body[i + 12] != 0x48 ||
-                body[i + 13] != 0x8B || body[i + 14] != 0xD8 || body[i + 15] != 0x48 ||
-                body[i + 16] != 0x85 || body[i + 17] != 0xC0) {
-                continue;
-            }
-            DecodeRel32Call(body + i + 2, radarPlayersFn + i + 2, findPlayerBySlotFn);
-            break;
+        const uint8_t* hit = FindPattern(
+            body, bodySize, "8B CF E8 ?? ?? ?? ?? 48 89 44 24 58 48 8B D8 48 85 C0");
+        if (hit != nullptr) {
+            DecodeRel32Call(hit + 2, radarPlayersFn + static_cast<size_t>(hit - body) + 2,
+                            findPlayerBySlotFn);
         }
     }
 
@@ -1146,38 +1285,38 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         return false;
     }
 
-    // GetEntityBySlot (FUN_180926920): controller array by slot.
-    // Unique body ends with mov rax,[rcx+rax*8]; add rsp,28h; ret
-    // Prefer caller chain from icon renderer if we can find IsSpectatorCheck first.
+    // Patterns (Afx-style hex + ??). Keep short / structural when possible.
+    // GetEntityBySlot (FUN_180926920): sub rsp,28; cmp ecx,-1; ... call [rax+310h];
+    // mov rax,[rcx+rax*8]; ret
+    static const char kPatGetEntityBySlot[] =
+        "48 83 EC 28 83 F9 FF 75 17 48 8B 0D ?? ?? ?? ?? 48 8D 54 24 30 48 8B 01 "
+        "FF 90 10 03 00 00 8B 08 48 63 C1 48 8D 0D ?? ?? ?? ?? 48 8B 04 C1 48 83 C4 28 C3";
+    // IsSpectatorCheck: mov [rsp+8],rbx; push rdi; sub rsp,20; mov rbx,rcx; lea; call;
+    // cmp [rbx+0x3E7],1
+    static const char kPatIsSpectatorCheck[] =
+        "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
+        "80 BB E7 03 00 00 01";
+    // SetRadarIconType prologue ending in call getLocal
+    static const char kPatSetRadarIconType[] =
+        "40 56 57 41 56 48 83 EC 20 8B FA 4C 8B F1 E8";
+    // GetCompColorArgb (cl_teammate_color_*)
+    static const char kPatGetCompColorArgb[] =
+        "40 53 48 83 EC 20 48 8B D9 83 FA FF 7D";
+    // RadarIconColor (e460e0) start
+    static const char kPatRadarIconColor[] =
+        "48 85 D2 0F 84 ?? ?? ?? ?? 56 41 57 48 83 EC 58";
+
+    // GetEntityBySlot: prefer call-chain from icon colour, else first body hit.
     {
         auto looksLikeGetEntityBySlot = [&](uintptr_t fn) -> bool {
-            if (!IsInsideModule(client, fn)) {
-                return false;
-            }
-            const auto* p = reinterpret_cast<const uint8_t*>(fn);
-            return p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC && p[3] == 0x28 && p[4] == 0x83 &&
-                p[5] == 0xF9 && p[6] == 0xFF && p[7] == 0x75 && p[8] == 0x17 && p[24] == 0xFF &&
-                p[25] == 0x90 && p[26] == 0x10 && p[27] == 0x03 && p[28] == 0x00 && p[29] == 0x00 &&
-                p[42] == 0x48 && p[43] == 0x8B && p[44] == 0x04 && p[45] == 0xC1 && p[46] == 0x48 &&
-                p[47] == 0x83 && p[48] == 0xC4 && p[49] == 0x28 && p[50] == 0xC3;
+            return IsInsideModule(client, fn) &&
+                MatchPattern(reinterpret_cast<const uint8_t*>(fn), 0x80, kPatGetEntityBySlot);
         };
 
-        // IsSpectatorCheck prologue+team-cmp — used only to find GetEntityBySlot call chain.
         uintptr_t isSpecFn = 0;
-        if (client.base != nullptr && client.size >= 32) {
-            for (size_t i = 0; i + 32 <= client.size; ++i) {
-                const uint8_t* p = client.base + i;
-                if (p[0] != 0x48 || p[1] != 0x89 || p[2] != 0x5C || p[3] != 0x24 || p[4] != 0x08 ||
-                    p[5] != 0x57 || p[6] != 0x48 || p[7] != 0x83 || p[8] != 0xEC || p[9] != 0x20 ||
-                    p[10] != 0x48 || p[11] != 0x8B || p[12] != 0xD9 || p[13] != 0x48 ||
-                    p[14] != 0x8D || p[15] != 0x0D || p[20] != 0xE8 || p[25] != 0x80 ||
-                    p[26] != 0xBB || p[27] != 0xE7 || p[28] != 0x03 || p[29] != 0x00 ||
-                    p[30] != 0x00 || p[31] != 0x01) {
-                    continue;
-                }
-                isSpecFn = reinterpret_cast<uintptr_t>(p);
-                break;
-            }
+        if (const uint8_t* hit =
+                FindPattern(client.base, client.size, kPatIsSpectatorCheck)) {
+            isSpecFn = reinterpret_cast<uintptr_t>(hit);
         }
 
         if (isSpecFn != 0 && client.base != nullptr) {
@@ -1220,17 +1359,11 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
 
         if (g_origGetEntityBySlot == nullptr && client.base != nullptr) {
-            std::vector<uintptr_t> hits;
-            for (size_t i = 0; i + 0x33 <= client.size; ++i) {
-                const uintptr_t addr = reinterpret_cast<uintptr_t>(client.base + i);
-                if (looksLikeGetEntityBySlot(addr)) {
-                    hits.push_back(addr);
-                }
-            }
-            // Prefer the controller-array helper used by radar (first in image is 0x926920).
+            const auto hits = FindPatternAll(client.base, client.size, kPatGetEntityBySlot, 8);
             if (!hits.empty()) {
-                g_origGetEntityBySlot = reinterpret_cast<GetEntityBySlotFn>(hits[0]);
-                Log("Radar POV: GetEntityBySlot @ %p (body mask, %zu candidates)",
+                g_origGetEntityBySlot =
+                    reinterpret_cast<GetEntityBySlotFn>(reinterpret_cast<uintptr_t>(hits[0]));
+                Log("Radar POV: GetEntityBySlot @ %p (pattern, %zu hits)",
                     reinterpret_cast<void*>(hits[0]), hits.size());
             }
         }
@@ -1240,24 +1373,20 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
-    // FUN_180e39320 — 40 56 57 41 56 48 83 EC 20 8B FA 4C 8B F1 E8 <getLocal>
+    // FUN_180e39320 — prologue + first call is getLocal
     {
         constexpr size_t kCallGetLocalOff = 14;
-        auto looksLike = [&](uintptr_t fn) -> bool {
-            if (!IsInsideModule(client, fn)) {
-                return false;
-            }
-            const auto* p = reinterpret_cast<const uint8_t*>(fn);
-            return p[0] == 0x40 && p[1] == 0x56 && p[2] == 0x57 && p[3] == 0x41 && p[4] == 0x56 &&
-                p[5] == 0x48 && p[6] == 0x83 && p[7] == 0xEC && p[8] == 0x20 && p[9] == 0x8B &&
-                p[10] == 0xFA && p[11] == 0x4C && p[12] == 0x8B && p[13] == 0xF1 && p[14] == 0xE8;
-        };
         if (radarPlayersFn != 0 && getLocalFn != 0) {
             const auto* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
             const size_t bodySize = ApproxFnSize(radarPlayersFn);
             for (size_t i = 0; i + 5 < bodySize; ++i) {
                 uintptr_t target = 0;
-                if (!DecodeRel32Call(body + i, radarPlayersFn + i, target) || !looksLike(target)) {
+                if (!DecodeRel32Call(body + i, radarPlayersFn + i, target)) {
+                    continue;
+                }
+                if (!IsInsideModule(client, target) ||
+                    !MatchPattern(reinterpret_cast<const uint8_t*>(target), 0x20,
+                                  kPatSetRadarIconType)) {
                     continue;
                 }
                 uintptr_t first = 0;
@@ -1271,98 +1400,50 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
             }
         }
         if (g_origSetRadarIconType == nullptr) {
+            // Fallback: unique prologue scan (verify first call == getLocal when known).
+            if (const uint8_t* hit =
+                    FindPattern(client.base, client.size, kPatSetRadarIconType)) {
+                const uintptr_t fn = reinterpret_cast<uintptr_t>(hit);
+                uintptr_t first = 0;
+                if (getLocalFn == 0 ||
+                    (DecodeRel32Call(hit + kCallGetLocalOff, fn + kCallGetLocalOff, first) &&
+                     first == getLocalFn)) {
+                    g_origSetRadarIconType = reinterpret_cast<SetRadarIconTypeFn>(fn);
+                    Log("Radar POV: SetRadarIconType @ %p (pattern)", reinterpret_cast<void*>(fn));
+                }
+            }
+        }
+        if (g_origSetRadarIconType == nullptr) {
             Log("Radar POV: SetRadarIconType not found — live type 0x11 may block RGB");
         }
     }
 
-    // FUN_180849370 — cl_teammate_color_N ARGB
-    {
-        const uint8_t kPat[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
-                                0x83, 0xFA, 0xFF, 0x7D};
-        const uint8_t* hit = FindBytes(client.base, client.size, kPat, sizeof(kPat));
-        if (hit != nullptr) {
-            g_getCompColorArgb =
-                reinterpret_cast<GetCompColorArgbFn>(reinterpret_cast<uintptr_t>(hit));
-            Log("Radar POV: GetCompColorArgb @ %p", hit);
-        }
+    if (const uint8_t* hit = FindPattern(client.base, client.size, kPatGetCompColorArgb)) {
+        g_getCompColorArgb =
+            reinterpret_cast<GetCompColorArgbFn>(reinterpret_cast<uintptr_t>(hit));
+        Log("Radar POV: GetCompColorArgb @ %p", hit);
     }
 
-    // FUN_180e460e0 + ResolvePlayerByIndex via IsSpectatorCheck/GetEntityBySlot call chain
-    if (g_origGetEntityBySlot != nullptr && client.base != nullptr) {
-        // Locate IsSpectatorCheck for xref (same mask as earlier)
-        uintptr_t isSpecFn = 0;
-        for (size_t i = 0; i + 32 <= client.size; ++i) {
-            const uint8_t* p = client.base + i;
-            if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C && p[3] == 0x24 && p[4] == 0x08 &&
-                p[5] == 0x57 && p[6] == 0x48 && p[7] == 0x83 && p[8] == 0xEC && p[9] == 0x20 &&
-                p[10] == 0x48 && p[11] == 0x8B && p[12] == 0xD9 && p[25] == 0x80 && p[26] == 0xBB &&
-                p[27] == 0xE7) {
-                isSpecFn = reinterpret_cast<uintptr_t>(p);
-                break;
+    // FUN_180e460e0: pattern prologue, then extract ResolvePlayerByIndex call.
+    if (const uint8_t* hit = FindPattern(client.base, client.size, kPatRadarIconColor)) {
+        const uintptr_t fn = reinterpret_cast<uintptr_t>(hit);
+        g_origRadarIconColor = reinterpret_cast<RadarIconColorFn>(fn);
+        Log("Radar POV: RadarIconColor @ %p", reinterpret_cast<void*>(fn));
+        const auto* p = hit;
+        const size_t fnSize = ApproxFnSize(fn);
+        // mov ecx,[rsi+0x158]; call ResolvePlayerByIndex
+        if (const uint8_t* callSite =
+                FindPattern(p, fnSize < 0x200 ? fnSize : 0x200, "8B 8E 58 01 00 00 E8")) {
+            uintptr_t resolveFn = 0;
+            if (DecodeRel32Call(callSite + 6,
+                                fn + static_cast<size_t>(callSite - p) + 6, resolveFn) &&
+                IsInsideModule(client, resolveFn)) {
+                g_resolvePlayerByIndex = reinterpret_cast<ResolvePlayerByIndexFn>(resolveFn);
+                Log("Radar POV: ResolvePlayerByIndex @ %p", reinterpret_cast<void*>(resolveFn));
             }
         }
-        if (isSpecFn != 0) {
-            const uintptr_t getEnt = reinterpret_cast<uintptr_t>(g_origGetEntityBySlot);
-            const uintptr_t base = reinterpret_cast<uintptr_t>(client.base);
-            for (size_t i = 0; i + 5 < client.size; ++i) {
-                if (client.base[i] != 0xE8) {
-                    continue;
-                }
-                uintptr_t t = 0;
-                if (!DecodeRel32Call(client.base + i, base + i, t) || t != isSpecFn) {
-                    continue;
-                }
-                bool sawGetEnt = false;
-                const size_t backStart = i > 0x40 ? i - 0x40 : 0;
-                for (size_t j = backStart; j + 5 < i; ++j) {
-                    uintptr_t gt = 0;
-                    if (DecodeRel32Call(client.base + j, base + j, gt) && gt == getEnt) {
-                        sawGetEnt = true;
-                        break;
-                    }
-                }
-                if (!sawGetEnt) {
-                    continue;
-                }
-                // Walk back to TEST RDX,RDX prologue
-                for (size_t back = 0x20; back < 0x120 && back <= i; ++back) {
-                    const uint8_t* cand = client.base + i - back;
-                    if (cand[0] != 0x48 || cand[1] != 0x85 || cand[2] != 0xD2) {
-                        continue;
-                    }
-                    if (i > back) {
-                        const uint8_t prev = client.base[i - back - 1];
-                        if (prev != 0xCC && prev != 0x90 && prev != 0xC3 && back < 0x80) {
-                            continue;
-                        }
-                    }
-                    const uintptr_t fn = base + i - back;
-                    g_origRadarIconColor = reinterpret_cast<RadarIconColorFn>(fn);
-                    Log("Radar POV: RadarIconColor @ %p", reinterpret_cast<void*>(fn));
-                    const auto* p = reinterpret_cast<const uint8_t*>(fn);
-                    const size_t fnSize = ApproxFnSize(fn);
-                    for (size_t k = 0; k + 10 < fnSize && k < 0x200; ++k) {
-                        if (p[k] == 0x8B && p[k + 1] == 0x8E && p[k + 2] == 0x58 &&
-                            p[k + 3] == 0x01 && p[k + 4] == 0x00 && p[k + 5] == 0x00 &&
-                            p[k + 6] == 0xE8) {
-                            uintptr_t resolveFn = 0;
-                            if (DecodeRel32Call(p + k + 6, fn + k + 6, resolveFn) &&
-                                IsInsideModule(client, resolveFn)) {
-                                g_resolvePlayerByIndex =
-                                    reinterpret_cast<ResolvePlayerByIndexFn>(resolveFn);
-                                Log("Radar POV: ResolvePlayerByIndex @ %p",
-                                    reinterpret_cast<void*>(resolveFn));
-                            }
-                            break;
-                        }
-                    }
-                    break;
-                }
-                if (g_origRadarIconColor != nullptr) {
-                    break;
-                }
-            }
-        }
+    } else {
+        Log("Radar POV: RadarIconColor not found");
     }
 
     g_origRadarUpdate = reinterpret_cast<RadarUpdateFn>(radarUpdateFn);
