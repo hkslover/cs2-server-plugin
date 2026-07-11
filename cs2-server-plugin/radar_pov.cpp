@@ -23,10 +23,19 @@ namespace {
 RadarPovLogFn g_log = nullptr;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_installed{false};
+// OFF by default: is_enemy/get_slot redirects caused instant demo-start crashes
+// when observer target (pawn) was passed into APIs that expect a controller.
+std::atomic<bool> g_aggressiveRedirects{false};
 
 // Set for the duration of CCSGO_HudRadar player-icon update so helper hooks
 // only redirect when the radar is evaluating icons (not unrelated game code).
 thread_local int g_inRadarPlayerUpdate = 0;
+
+// First-fault log throttles so a tight radar loop cannot flood csdm.log.
+std::atomic<int> g_faultRadarMode{0};
+std::atomic<int> g_faultRadarPlayers{0};
+std::atomic<int> g_faultIsEnemy{0};
+std::atomic<int> g_faultGetSlot{0};
 
 void Log(const char* fmt, ...)
 {
@@ -288,65 +297,113 @@ void ForceClearShowAllFlag(void* radar)
 }
 
 // ---------------------------------------------------------------------------
-// Detours
+// Detours (MSVC SEH: catch access violations so a bad redirect cannot hard-crash)
 // ---------------------------------------------------------------------------
 
 void __fastcall Hook_RadarMode(void* radar)
 {
-    if (g_origRadarMode != nullptr) {
-        g_origRadarMode(radar);
-    }
-    if (g_enabled.load(std::memory_order_relaxed)) {
-        // Ensure force-show-all is off so player filter uses team/spotted rules.
-        ForceClearShowAllFlag(radar);
+    __try {
+        if (g_origRadarMode != nullptr) {
+            g_origRadarMode(radar);
+        }
+        if (g_enabled.load(std::memory_order_relaxed) && radar != nullptr) {
+            // Clear engine "show everyone while spectating" bit.
+            ForceClearShowAllFlag(radar);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_faultRadarMode.fetch_add(1) == 0) {
+            Log("Radar POV: EXCEPTION in Hook_RadarMode (code=0x%08lX) radar=%p",
+                GetExceptionCode(), radar);
+        }
     }
 }
 
 void __fastcall Hook_RadarPlayers(void* radar)
 {
     const bool pov = g_enabled.load(std::memory_order_relaxed);
-    if (pov) {
-        ++g_inRadarPlayerUpdate;
-        ForceClearShowAllFlag(radar);
+    const bool aggressive = g_aggressiveRedirects.load(std::memory_order_relaxed);
+    __try {
+        if (pov && aggressive) {
+            ++g_inRadarPlayerUpdate;
+        }
+        if (pov && radar != nullptr) {
+            ForceClearShowAllFlag(radar);
+        }
+        if (g_origRadarPlayers != nullptr) {
+            g_origRadarPlayers(radar);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_faultRadarPlayers.fetch_add(1) == 0) {
+            Log("Radar POV: EXCEPTION in Hook_RadarPlayers (code=0x%08lX) radar=%p",
+                GetExceptionCode(), radar);
+        }
     }
-    if (g_origRadarPlayers != nullptr) {
-        g_origRadarPlayers(radar);
-    }
-    if (pov) {
+    if (pov && aggressive && g_inRadarPlayerUpdate > 0) {
         --g_inRadarPlayerUpdate;
     }
 }
 
 uint8_t __fastcall Hook_IsEnemy(void* localPlayer, int otherSlot)
 {
-    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarPlayerUpdate > 0 &&
-        localPlayer != nullptr && g_getObserverTarget != nullptr && g_origIsEnemy != nullptr) {
-        void* target = g_getObserverTarget(localPlayer);
-        if (target != nullptr) {
-            // Evaluate enemy/teammate relative to the observed player, not the
-            // free spectator client.
-            return g_origIsEnemy(target, otherSlot);
+    // Aggressive path: re-run isEnemy using observer target as the "self" entity.
+    // This is crash-prone if target is a pawn but the function expects a controller,
+    // so it is gated and wrapped in SEH.
+    if (g_enabled.load(std::memory_order_relaxed) &&
+        g_aggressiveRedirects.load(std::memory_order_relaxed) &&
+        g_inRadarPlayerUpdate > 0 && localPlayer != nullptr &&
+        g_getObserverTarget != nullptr && g_origIsEnemy != nullptr) {
+        __try {
+            void* target = g_getObserverTarget(localPlayer);
+            if (target != nullptr) {
+                return g_origIsEnemy(target, otherSlot);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (g_faultIsEnemy.fetch_add(1) == 0) {
+                Log("Radar POV: EXCEPTION in Hook_IsEnemy redirect (code=0x%08lX) local=%p slot=%d — falling back",
+                    GetExceptionCode(), localPlayer, otherSlot);
+            }
         }
     }
     if (g_origIsEnemy != nullptr) {
-        return g_origIsEnemy(localPlayer, otherSlot);
+        __try {
+            return g_origIsEnemy(localPlayer, otherSlot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (g_faultIsEnemy.fetch_add(1) == 0) {
+                Log("Radar POV: EXCEPTION in original is_enemy (code=0x%08lX)", GetExceptionCode());
+            }
+            return 1;
+        }
     }
     return 1;
 }
 
 int* __fastcall Hook_GetPlayerSlot(void* player, int* outSlot)
 {
-    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarPlayerUpdate > 0 &&
-        player != nullptr && g_getObserverTarget != nullptr && g_origGetPlayerSlot != nullptr) {
-        void* target = g_getObserverTarget(player);
-        if (target != nullptr) {
-            // Spotted-by mask is indexed by the reference player's slot. Use
-            // the observed player's slot so enemy red dots follow their FOV.
-            return g_origGetPlayerSlot(target, outSlot);
+    if (g_enabled.load(std::memory_order_relaxed) &&
+        g_aggressiveRedirects.load(std::memory_order_relaxed) &&
+        g_inRadarPlayerUpdate > 0 && player != nullptr &&
+        g_getObserverTarget != nullptr && g_origGetPlayerSlot != nullptr) {
+        __try {
+            void* target = g_getObserverTarget(player);
+            if (target != nullptr) {
+                return g_origGetPlayerSlot(target, outSlot);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (g_faultGetSlot.fetch_add(1) == 0) {
+                Log("Radar POV: EXCEPTION in Hook_GetPlayerSlot redirect (code=0x%08lX) player=%p — falling back",
+                    GetExceptionCode(), player);
+            }
         }
     }
     if (g_origGetPlayerSlot != nullptr) {
-        return g_origGetPlayerSlot(player, outSlot);
+        __try {
+            return g_origGetPlayerSlot(player, outSlot);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (g_faultGetSlot.fetch_add(1) == 0) {
+                Log("Radar POV: EXCEPTION in original get_slot (code=0x%08lX)", GetExceptionCode());
+            }
+            return outSlot;
+        }
     }
     return outSlot;
 }
@@ -722,24 +779,35 @@ bool InstallHooks()
         return false;
     }
 
-    if (enemyTarget != nullptr) {
-        if (!CreateAndEnableHook(enemyTarget, reinterpret_cast<void*>(&Hook_IsEnemy),
-                                 reinterpret_cast<void**>(&g_origIsEnemy), "is_enemy")) {
-            Log("Radar POV: is-enemy hook failed (continuing with partial hooks)");
-            g_origIsEnemy = nullptr;
+    // Aggressive hooks only when explicitly enabled. Log shows install succeeded
+    // with all four hooks then crashed on first demo radar tick — redirects are
+    // the likely fault (wrong thisptr type into is_enemy/get_slot).
+    if (g_aggressiveRedirects.load(std::memory_order_relaxed)) {
+        if (enemyTarget != nullptr) {
+            if (!CreateAndEnableHook(enemyTarget, reinterpret_cast<void*>(&Hook_IsEnemy),
+                                     reinterpret_cast<void**>(&g_origIsEnemy), "is_enemy")) {
+                Log("Radar POV: is-enemy hook failed (continuing without it)");
+                g_origIsEnemy = nullptr;
+            }
         }
-    }
-
-    if (slotTarget != nullptr) {
-        if (!CreateAndEnableHook(slotTarget, reinterpret_cast<void*>(&Hook_GetPlayerSlot),
-                                 reinterpret_cast<void**>(&g_origGetPlayerSlot), "get_slot")) {
-            Log("Radar POV: get-slot hook failed (continuing with partial hooks)");
-            g_origGetPlayerSlot = nullptr;
+        if (slotTarget != nullptr) {
+            if (!CreateAndEnableHook(slotTarget, reinterpret_cast<void*>(&Hook_GetPlayerSlot),
+                                     reinterpret_cast<void**>(&g_origGetPlayerSlot), "get_slot")) {
+                Log("Radar POV: get-slot hook failed (continuing without it)");
+                g_origGetPlayerSlot = nullptr;
+            }
         }
+    } else {
+        Log("Radar POV: safe mode — only radar_mode + radar_players (no is_enemy/get_slot redirects)");
+        // Keep resolved addresses for optional future enable without re-resolve.
+        g_origIsEnemy = reinterpret_cast<IsEnemyFn>(enemyTarget);
+        g_origGetPlayerSlot = reinterpret_cast<GetPlayerSlotFn>(slotTarget);
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: MinHook hooks installed (enabled=%d)", g_enabled.load() ? 1 : 0);
+    Log("Radar POV: MinHook hooks installed (enabled=%d aggressive=%d)",
+        g_enabled.load() ? 1 : 0,
+        g_aggressiveRedirects.load() ? 1 : 0);
     return true;
 }
 
@@ -791,6 +859,18 @@ void RadarPov_SetEnabled(bool enabled)
 bool RadarPov_IsEnabled()
 {
     return g_enabled.load(std::memory_order_relaxed);
+}
+
+void RadarPov_SetAggressiveRedirects(bool enabled)
+{
+    g_aggressiveRedirects.store(enabled, std::memory_order_relaxed);
+    Log("Radar POV: aggressive_redirects=%d (re-install hooks to apply is_enemy/get_slot)",
+        enabled ? 1 : 0);
+}
+
+bool RadarPov_AggressiveRedirectsEnabled()
+{
+    return g_aggressiveRedirects.load(std::memory_order_relaxed);
 }
 
 bool RadarPov_Install()

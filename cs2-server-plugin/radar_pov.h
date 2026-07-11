@@ -27,6 +27,14 @@ void RadarPov_SetLogger(RadarPovLogFn logger);
 void RadarPov_SetEnabled(bool enabled);
 bool RadarPov_IsEnabled();
 
+// Aggressive redirects (is_enemy / get_slot) re-interpret team & spotted relative
+// to the observer target. These are OFF by default: they are the main crash risk
+// if the helper signatures or object types (controller vs pawn) are wrong.
+// Safe mode only clears the engine "show all when spectating" flag via the
+// radar_mode / radar_players hooks.
+void RadarPov_SetAggressiveRedirects(bool enabled);
+bool RadarPov_AggressiveRedirectsEnabled();
+
 // Resolve client.dll radar functions and install hooks.
 // Returns true if hooks are active. Failures are logged and non-fatal.
 bool RadarPov_Install();
