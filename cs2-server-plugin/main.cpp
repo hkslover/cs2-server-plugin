@@ -730,23 +730,22 @@ EXPORT void* CreateInterface(const char* pName, int* pReturnCode)
 }
 
 #ifdef CON_COMMAND_ENABLED
-CON_COMMAND(csdm_radar_pov, "Radar POV: csdm_radar_pov 0|1 [aggressive 0|1]")
+CON_COMMAND(csdm_radar_pov, "Radar POV (true first-person while spectating): csdm_radar_pov 0|1")
 {
     if (args.ArgC() < 2) {
-        Log("csdm_radar_pov = %d installed=%d aggressive=%d. Usage: csdm_radar_pov 0|1 [aggressive 0|1]",
+        Log("csdm_radar_pov = %d installed=%d. Usage: csdm_radar_pov 0|1  (true POV = getLocal->observed controller)",
             RadarPov_IsEnabled() ? 1 : 0,
-            RadarPov_IsInstalled() ? 1 : 0,
-            RadarPov_AggressiveRedirectsEnabled() ? 1 : 0);
+            RadarPov_IsInstalled() ? 1 : 0);
         return;
     }
     const bool enabled = atoi(args.Arg(1)) != 0;
+    // Optional 2nd arg kept for old scripts; ignored for hook selection.
     if (args.ArgC() >= 3) {
         RadarPov_SetAggressiveRedirects(atoi(args.Arg(2)) != 0);
     }
     RadarPov_SetEnabled(enabled);
     if (enabled) {
         if (RadarPov_IsInstalled()) {
-            // Re-install so aggressive flag changes which hooks are created.
             RadarPov_Uninstall();
         }
         RadarPov_SetLogger(&Log);
@@ -758,18 +757,16 @@ CON_COMMAND(csdm_radar_pov, "Radar POV: csdm_radar_pov 0|1 [aggressive 0|1]")
     } else if (RadarPov_IsInstalled()) {
         RadarPov_Uninstall();
     }
-    Log("csdm_radar_pov set to %d aggressive=%d", enabled ? 1 : 0,
-        RadarPov_AggressiveRedirectsEnabled() ? 1 : 0);
+    Log("csdm_radar_pov set to %d installed=%d", enabled ? 1 : 0, RadarPov_IsInstalled() ? 1 : 0);
 }
 
 CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
 {
     Log("Tick: %d", currentTick.load());
     Log("Is playing demo: %d", isPlayingDemo);
-    Log("Radar POV: enabled=%d installed=%d aggressive=%d",
+    Log("Radar POV: enabled=%d installed=%d (getLocal->observed controller)",
         RadarPov_IsEnabled() ? 1 : 0,
-        RadarPov_IsInstalled() ? 1 : 0,
-        RadarPov_AggressiveRedirectsEnabled() ? 1 : 0);
+        RadarPov_IsInstalled() ? 1 : 0);
 
     if (ws != NULL) {
         Log("WebSocket connected");

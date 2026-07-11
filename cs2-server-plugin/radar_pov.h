@@ -2,36 +2,34 @@
 
 // First-person radar simulation for CS2 demo spectating.
 //
-// Demo/GOTV radar defaults to "show everyone". The engine cvar
-// cl_radar_show_all_players_when_spectating only toggles that bypass; when it
-// is 0 the filter still uses the *local spectator* as the team/spotted
-// reference, so teammates of the observed player disappear.
+// Real non-spectator radar path in client.dll (CCSGO_HudRadar player update):
+//   getLocal() -> local *controller*
+//   getSlot(controller) / getTeam(controller) / isEnemy(controller, slot)
+//   enemies only when spotted; teammates always shown
 //
-// This module hooks client.dll radar helpers so visibility is evaluated from
-// the current observer target (spec_player) instead:
-//   - teammates of the observed player stay visible
-//   - enemies follow spotted rules
-//   - the force-show-all flag is kept clear while POV mode is on
+// Demo/GOTV spectating uses the spectator controller as "self", so after
+// clearing show-all the filter is wrong (no teammates of the observed player).
 //
-// Windows x64 only for now. Install is best-effort and must never crash the
-// rest of the plugin if signatures fail after a game update.
+// Fix: while the radar player-icon update runs, hook getLocal so it returns the
+// *observed player's controller* (pawn.m_hController), matching live 1P.
+// Show-all flag is forced off. Do NOT pass observer *pawn* into isEnemy/getSlot
+// (those APIs expect a controller — that crash path is retired).
+//
+// Windows x64 only. Install is best-effort and must never crash the rest of the
+// plugin if signatures fail after a game update.
 
 #include <cstdarg>
 
 using RadarPovLogFn = void (*)(const char* fmt, ...);
 
-// Optional logger (e.g. main.cpp Log). Safe to leave unset.
 void RadarPov_SetLogger(RadarPovLogFn logger);
 
 // Default is enabled. Can be toggled before or after Install.
 void RadarPov_SetEnabled(bool enabled);
 bool RadarPov_IsEnabled();
 
-// Aggressive redirects (is_enemy / get_slot) re-interpret team & spotted relative
-// to the observer target. These are OFF by default: they are the main crash risk
-// if the helper signatures or object types (controller vs pawn) are wrong.
-// Safe mode only clears the engine "show all when spectating" flag via the
-// radar_mode / radar_players hooks.
+// Legacy flag kept for csdm_radar_pov compatibility. No longer installs the
+// crashy is_enemy/get_slot pawn redirects; true POV is always via getLocal.
 void RadarPov_SetAggressiveRedirects(bool enabled);
 bool RadarPov_AggressiveRedirectsEnabled();
 
