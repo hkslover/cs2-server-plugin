@@ -1,0 +1,4 @@
+interface:
+  display_name: "CS2 Radar POV Maintenance"
+  short_description: "维护 CS2 Demo 第一视角雷达逆向与兼容工作流"
+  default_prompt: "Use $radar-pov-maintenance to inspect and update CS2 radar POV compatibility after a client.dll update."
