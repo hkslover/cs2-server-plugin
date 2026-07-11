@@ -626,7 +626,7 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     // Mode is the non-reg function that has E8 call sites (atexit has none).
     const auto convarXrefs = FindLeaRipXrefs(client, convarObj);
     uintptr_t radarModeFn = 0;
-    uintptr_t radarTickFn = 0;
+    uintptr_t modeCallSite = 0; // address of E8 that calls mode (inside tick)
     for (uintptr_t xref : convarXrefs) {
         uintptr_t fn = FindFunctionStart(client, xref);
         if (fn == 0 || fn == regFn) {
@@ -640,43 +640,51 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
             continue;
         }
         radarModeFn = fn;
-        radarTickFn = FindFunctionStart(client, callSites[0]);
-        Log("Radar POV: radar mode fn @ %p (E8 callers=%zu, size 0x%zx)",
-            reinterpret_cast<void*>(radarModeFn), callSites.size(), ApproxFnSize(fn));
+        modeCallSite = callSites[0];
+        Log("Radar POV: radar mode fn @ %p (E8 callers=%zu, size 0x%zx, call site @ %p)",
+            reinterpret_cast<void*>(radarModeFn), callSites.size(), ApproxFnSize(fn),
+            reinterpret_cast<void*>(modeCallSite));
         break;
     }
-    if (radarModeFn == 0 || radarTickFn == 0 || radarTickFn == radarModeFn) {
-        Log("Radar POV: radar mode/tick function not found");
+    if (radarModeFn == 0 || modeCallSite == 0) {
+        Log("Radar POV: radar mode function not found");
         return false;
     }
-    Log("Radar POV: radar tick fn @ %p", reinterpret_cast<void*>(radarTickFn));
 
-    // In tick: call sequence ... mode, next, players, ...
-    // From Ghidra: after FUN_180e1f000 comes FUN_180e31f90 then FUN_180e328a0.
-    const auto tickCalls = CollectDirectCalls(radarTickFn, 0x400);
+    // Tick function start is best-effort (prolog scan can land early). Do NOT rely
+    // on it to discover players — walk forward from the mode E8 site instead.
+    // Ghidra sequence at the call site:
+    //   call mode
+    //   mov  rcx, rsi
+    //   call intermediate   (layout/scale helper)
+    //   mov  rcx, rsi
+    //   call players        ← FUN_180e328a0
     uintptr_t radarPlayersFn = 0;
-    for (size_t i = 0; i < tickCalls.size(); ++i) {
-        if (tickCalls[i] == radarModeFn && i + 2 < tickCalls.size()) {
-            radarPlayersFn = tickCalls[i + 2];
-            break;
-        }
-    }
-    if (radarPlayersFn == 0) {
-        // Fallback: pick a large-ish following call target.
-        bool seenMode = false;
-        int after = 0;
-        for (uintptr_t c : tickCalls) {
-            if (c == radarModeFn) {
-                seenMode = true;
+    {
+        const uintptr_t scanFrom = modeCallSite + 5; // first byte after E8 to mode
+        std::vector<uintptr_t> afterMode;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(scanFrom);
+        for (size_t i = 0; i + 5 < 0x80 && afterMode.size() < 6; ++i) {
+            uintptr_t target = 0;
+            if (!DecodeRel32Call(p + i, scanFrom + i, target)) {
                 continue;
             }
-            if (seenMode) {
-                ++after;
-                if (after == 2) {
-                    radarPlayersFn = c;
-                    break;
-                }
+            if (!IsInsideModule(client, target) || target == radarModeFn) {
+                continue;
             }
+            afterMode.push_back(target);
+            i += 4;
+        }
+        if (afterMode.size() >= 2) {
+            radarPlayersFn = afterMode[1];
+        } else if (afterMode.size() == 1) {
+            radarPlayersFn = afterMode[0];
+        }
+        Log("Radar POV: calls after mode: %zu (players candidate @ %p)", afterMode.size(),
+            reinterpret_cast<void*>(radarPlayersFn));
+        for (size_t i = 0; i < afterMode.size(); ++i) {
+            Log("Radar POV:   after[%zu] = %p size=0x%zx", i,
+                reinterpret_cast<void*>(afterMode[i]), ApproxFnSize(afterMode[i]));
         }
     }
     if (radarPlayersFn == 0) {
