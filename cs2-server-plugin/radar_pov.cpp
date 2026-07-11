@@ -250,6 +250,10 @@ using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
 using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
 // Resolves the player entity used by the per-slot radar loop.
 using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
+// Per-player icon renderer checks FUN_18085b540 (entity->m_iTeamNum == 1 etc.) in
+// addition to the vtable+0x2B0 demo state.  It must return false during a POV frame
+// or the engine keeps the spectator team-colour path instead of per-player colours.
+using IsSpectatorCheckFn = uint8_t(__fastcall*)(void* entity);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
 RadarPresentationFn g_origRadarPresentation = nullptr;
@@ -258,6 +262,7 @@ GetLocalFn g_origGetLocal = nullptr;
 GetObserverTargetFn g_getObserverTarget = nullptr;
 GetPlayerSlotFn g_getPlayerSlot = nullptr;
 FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
+IsSpectatorCheckFn g_origIsSpectatorCheck = nullptr;
 
 bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
@@ -572,6 +577,18 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
         return nullptr;
     }
     return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
+}
+
+// FUN_18085b540(entity): returns 1 if the entity is a spectator (m_iTeamNum == 1
+// or 0x788/0x6E8 flags).  The per-player icon renderer calls it alongside the
+// engine demo-state check; both must return false for the engine to select the
+// live per-player colour classes rather than team-colour classes.
+uint8_t __fastcall Hook_IsSpectatorCheck(void* entity)
+{
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive) {
+        return 0;
+    }
+    return g_origIsSpectatorCheck != nullptr ? g_origIsSpectatorCheck(entity) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +981,28 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     g_origFindPlayerBySlot = findPlayerBySlotFn != 0
         ? reinterpret_cast<FindPlayerBySlotFn>(findPlayerBySlotFn)
         : nullptr;
+
+    // --- locate FUN_18085b540 (IsSpectatorCheck) ---
+    // Signature: cmp byte ptr [rbx+0x3E7], 1   →  80 BB E7 03 00 00 01
+    // This checks m_iTeamNum == 1 (SPECTATOR) and is unique in client.dll.
+    {
+        const uint8_t kIsSpecPattern[] = { 0x80, 0xBB, 0xE7, 0x03, 0x00, 0x00, 0x01 };
+        const uint8_t* hit = FindBytes(client.base, client.size,
+                                        kIsSpecPattern, sizeof(kIsSpecPattern));
+        if (hit != nullptr) {
+            const uintptr_t fnStart = FindFunctionStart(
+                client, reinterpret_cast<uintptr_t>(hit));
+            if (fnStart != 0 && IsInsideModule(client, fnStart)) {
+                g_origIsSpectatorCheck = reinterpret_cast<IsSpectatorCheckFn>(fnStart);
+                Log("Radar POV: IsSpectatorCheck @ %p (pattern @ %p)",
+                    reinterpret_cast<void*>(fnStart), hit);
+            }
+        }
+        if (g_origIsSpectatorCheck == nullptr) {
+            Log("Radar POV: IsSpectatorCheck not found; per-player colours may stay team-based");
+        }
+    }
+
     return true;
 }
 
@@ -976,6 +1015,7 @@ void ResetResolvedRadarState()
     g_getObserverTarget = nullptr;
     g_getPlayerSlot = nullptr;
     g_origFindPlayerBySlot = nullptr;
+    g_origIsSpectatorCheck = nullptr;
     g_spectatorFilterHooked = false;
     g_radarDemoStateGlobalSlot = 0;
     g_radarShowAllFlagOffset = 0;
@@ -1078,8 +1118,23 @@ bool InstallHooks()
         Log("Radar POV: spectator-slot filter unresolved; retaining engine player list");
     }
 
+    // FUN_18085b540 is the per-entity spectator check that the player-icon
+    // renderer pairs with the engine demo-state virtual.  Returning false
+    // during POV frames lets the engine choose per-player colour classes.
+    if (g_origIsSpectatorCheck != nullptr) {
+        if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origIsSpectatorCheck),
+                                 reinterpret_cast<void*>(&Hook_IsSpectatorCheck),
+                                 reinterpret_cast<void**>(&g_origIsSpectatorCheck),
+                                 "isSpectatorCheck")) {
+            Log("Radar POV: IsSpectatorCheck hook failed; per-player colours may stay team-based");
+            g_origIsSpectatorCheck = nullptr;
+        }
+    } else {
+        Log("Radar POV: IsSpectatorCheck unresolved; per-player colours may stay team-based");
+    }
+
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origRadarUpdate != nullptr ? 1 : 0,
@@ -1087,7 +1142,8 @@ bool InstallHooks()
         g_origRadarDemoState != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0,
         g_getObserverTarget != nullptr ? 1 : 0,
-        g_spectatorFilterHooked ? 1 : 0);
+        g_spectatorFilterHooked ? 1 : 0,
+        g_origIsSpectatorCheck != nullptr ? 1 : 0);
     return true;
 }
 
