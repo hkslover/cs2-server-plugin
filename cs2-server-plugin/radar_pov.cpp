@@ -33,6 +33,8 @@ thread_local bool g_povActive = false;
 // Demo owns a separate spectator pawn / player slot. It is not part of a live
 // player's radar world and must not be allowed through the normal slot loop.
 thread_local int g_spectatorSlot = -1;
+// Observed player's controller slot (for FUN_180926920 local remapping).
+thread_local int g_povSelfSlot = -1;
 
 std::atomic<int> g_faultRadarUpdate{0};
 std::atomic<int> g_faultGetLocal{0};
@@ -43,6 +45,7 @@ std::atomic<int> g_logSpectatorFilter{0};
 std::atomic<int> g_logPresentationOverride{0};
 std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logIsSpecCheckCalls{0};
+std::atomic<int> g_logGetEntityBySlot{0};
 
 void Log(const char* fmt, ...)
 {
@@ -255,6 +258,9 @@ using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 // addition to the vtable+0x2B0 demo state.  It must return false during a POV frame
 // or the engine keeps the spectator team-colour path instead of per-player colours.
 using IsSpectatorCheckFn = uint8_t(__fastcall*)(void* entity);
+// Controller lookup by player slot: FUN_180926920.  Icon colour path calls this
+// with slot 0 (hardcoded) as "local" — in demos that is the spectator controller.
+using GetEntityBySlotFn = void*(__fastcall*)(int slot);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
 RadarPresentationFn g_origRadarPresentation = nullptr;
@@ -264,9 +270,11 @@ GetObserverTargetFn g_getObserverTarget = nullptr;
 GetPlayerSlotFn g_getPlayerSlot = nullptr;
 FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 IsSpectatorCheckFn g_origIsSpectatorCheck = nullptr;
+GetEntityBySlotFn g_origGetEntityBySlot = nullptr;
 
 bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
+bool g_getEntityBySlotHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
 
 // getLocal validates return with vtable+0x4D8 = IsPlayerPawn (index 155).
@@ -447,6 +455,7 @@ void PreparePovContext()
     g_povSelfPawn = nullptr;
     g_povActive = false;
     g_spectatorSlot = -1;
+    g_povSelfSlot = -1;
 
     if (g_origGetLocal == nullptr || g_getObserverTarget == nullptr) {
         return;
@@ -476,14 +485,18 @@ void PreparePovContext()
             g_getPlayerSlot(povPawn, &povSlot);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             spectatorSlot = -1;
+            povSlot = -1;
         }
         if (spectatorSlot >= 0 && spectatorSlot != povSlot) {
             g_spectatorSlot = spectatorSlot;
         }
+        if (povSlot >= 0) {
+            g_povSelfSlot = povSlot;
+        }
     }
     if (g_logPovOk.fetch_add(1) == 0) {
-        Log("Radar POV: active — self pawn %p -> observed pawn %p (full radar context)",
-            realPawn, povPawn);
+        Log("Radar POV: active — self pawn %p -> observed pawn %p (slot %d, spectatorSlot %d)",
+            realPawn, povPawn, g_povSelfSlot, g_spectatorSlot);
     }
 }
 
@@ -492,6 +505,7 @@ void ClearPovContext()
     g_povSelfPawn = nullptr;
     g_povActive = false;
     g_spectatorSlot = -1;
+    g_povSelfSlot = -1;
 }
 
 // Parent update contains radar_mode, player icons and RadarPlayerSoundSnippet.
@@ -598,6 +612,28 @@ uint8_t __fastcall Hook_IsSpectatorCheck(void* entity)
         return 0;
     }
     return g_origIsSpectatorCheck != nullptr ? g_origIsSpectatorCheck(entity) : 0;
+}
+
+// FUN_180926920(slot): returns the controller at the global player-slot array.
+// Icon colour code (FUN_180e460e0) hardcodes slot 0 as "local".  In demos that is
+// the freecam spectator (team 1).  Live colour paint then requires:
+//   FUN_180848f80(local) == 2 (CT) or 3 (T)
+// so a spectator local skips all competitive RGB application even when the
+// spectator-vs-live branch is forced open.  Remap 0 / -1 to the observed slot.
+void* __fastcall Hook_GetEntityBySlot(int slot)
+{
+    if (g_origGetEntityBySlot == nullptr) {
+        return nullptr;
+    }
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
+        g_povSelfSlot >= 0 && (slot == 0 || slot == -1)) {
+        const int n = g_logGetEntityBySlot.fetch_add(1);
+        if (n == 0 || n == 50) {
+            Log("Radar POV: GetEntityBySlot %d -> observed slot %d", slot, g_povSelfSlot);
+        }
+        return g_origGetEntityBySlot(g_povSelfSlot);
+    }
+    return g_origGetEntityBySlot(slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,6 +1179,95 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
+    // --- locate FUN_180926920 (GetEntityBySlot / controller-by-slot) ---
+    // Icon colour path: xor ecx,ecx; call GetEntityBySlot; call IsSpectatorCheck.
+    // Prefer that call-chain (avoids a near-identical helper that indexes a
+    // different entity array).  Body shape: sub rsp,28h; cmp ecx,-1; ...
+    // call [rax+310h]; mov rax,[rcx+rax*8]; ret.
+    {
+        auto looksLikeGetEntityBySlot = [&](uintptr_t fn) -> bool {
+            if (!IsInsideModule(client, fn)) {
+                return false;
+            }
+            const auto* p = reinterpret_cast<const uint8_t*>(fn);
+            // Prologue + local-slot resolve + array load + ret (51 bytes).
+            return p[0] == 0x48 && p[1] == 0x83 && p[2] == 0xEC && p[3] == 0x28 &&
+                p[4] == 0x83 && p[5] == 0xF9 && p[6] == 0xFF && p[7] == 0x75 &&
+                p[8] == 0x17 && p[24] == 0xFF && p[25] == 0x90 && p[26] == 0x10 &&
+                p[27] == 0x03 && p[28] == 0x00 && p[29] == 0x00 && p[42] == 0x48 &&
+                p[43] == 0x8B && p[44] == 0x04 && p[45] == 0xC1 && p[46] == 0x48 &&
+                p[47] == 0x83 && p[48] == 0xC4 && p[49] == 0x28 && p[50] == 0xC3;
+        };
+
+        // Primary: reverse from IsSpectatorCheck call sites.
+        if (g_origIsSpectatorCheck != nullptr && client.base != nullptr) {
+            const uintptr_t isSpec =
+                reinterpret_cast<uintptr_t>(g_origIsSpectatorCheck);
+            const uintptr_t base = reinterpret_cast<uintptr_t>(client.base);
+            for (size_t i = 0; i + 5 < client.size; ++i) {
+                if (client.base[i] != 0xE8) {
+                    continue;
+                }
+                uintptr_t target = 0;
+                if (!DecodeRel32Call(client.base + i, base + i, target) || target != isSpec) {
+                    continue;
+                }
+                const size_t callOff = i;
+                const size_t backStart = callOff > 0x40 ? callOff - 0x40 : 0;
+                for (size_t j = backStart; j + 7 < callOff; ++j) {
+                    if (client.base[j] != 0x33 || client.base[j + 1] != 0xC9) {
+                        continue;
+                    }
+                    for (size_t k = j; k + 5 < callOff; ++k) {
+                        uintptr_t getEnt = 0;
+                        if (!DecodeRel32Call(client.base + k, base + k, getEnt)) {
+                            continue;
+                        }
+                        if (getEnt == isSpec || !looksLikeGetEntityBySlot(getEnt)) {
+                            continue;
+                        }
+                        g_origGetEntityBySlot =
+                            reinterpret_cast<GetEntityBySlotFn>(getEnt);
+                        Log("Radar POV: GetEntityBySlot @ %p (via IsSpectatorCheck caller)",
+                            reinterpret_cast<void*>(getEnt));
+                        break;
+                    }
+                    if (g_origGetEntityBySlot != nullptr) {
+                        break;
+                    }
+                }
+                if (g_origGetEntityBySlot != nullptr) {
+                    break;
+                }
+            }
+        }
+
+        // Fallback: full body mask (may match a second similar helper — only
+        // accept a unique hit, otherwise require the call-chain path above).
+        if (g_origGetEntityBySlot == nullptr && client.base != nullptr &&
+            client.size >= 0x33) {
+            std::vector<uintptr_t> hits;
+            for (size_t i = 0; i + 0x33 <= client.size; ++i) {
+                const uintptr_t addr = reinterpret_cast<uintptr_t>(client.base + i);
+                if (looksLikeGetEntityBySlot(addr)) {
+                    hits.push_back(addr);
+                }
+            }
+            if (hits.size() == 1) {
+                g_origGetEntityBySlot = reinterpret_cast<GetEntityBySlotFn>(hits[0]);
+                Log("Radar POV: GetEntityBySlot @ %p (unique body mask)",
+                    reinterpret_cast<void*>(hits[0]));
+            } else if (!hits.empty()) {
+                Log("Radar POV: GetEntityBySlot body mask ambiguous (%zu hits); need call-chain",
+                    hits.size());
+            }
+        }
+
+        if (g_origGetEntityBySlot == nullptr) {
+            Log("Radar POV: GetEntityBySlot not found; live colour paint may skip teammates");
+        }
+    }
+
     return true;
 }
 
@@ -1156,7 +1281,9 @@ void ResetResolvedRadarState()
     g_getPlayerSlot = nullptr;
     g_origFindPlayerBySlot = nullptr;
     g_origIsSpectatorCheck = nullptr;
+    g_origGetEntityBySlot = nullptr;
     g_spectatorFilterHooked = false;
+    g_getEntityBySlotHooked = false;
     g_radarDemoStateGlobalSlot = 0;
     g_radarShowAllFlagOffset = 0;
     g_installed.store(false, std::memory_order_release);
@@ -1273,8 +1400,24 @@ bool InstallHooks()
         Log("Radar POV: IsSpectatorCheck unresolved; per-player colours may stay team-based");
     }
 
+    // Remap FUN_180926920(0/-1) to the observed player's controller so live
+    // colour paint sees team 2/3 instead of spectator team 1.
+    if (g_origGetEntityBySlot != nullptr) {
+        if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origGetEntityBySlot),
+                                 reinterpret_cast<void*>(&Hook_GetEntityBySlot),
+                                 reinterpret_cast<void**>(&g_origGetEntityBySlot),
+                                 "getEntityBySlot")) {
+            Log("Radar POV: GetEntityBySlot hook failed; live colour paint may skip teammates");
+            g_origGetEntityBySlot = nullptr;
+        } else {
+            g_getEntityBySlotHooked = true;
+        }
+    } else {
+        Log("Radar POV: GetEntityBySlot unresolved; live colour paint may skip teammates");
+    }
+
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d getEntityBySlot=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origRadarUpdate != nullptr ? 1 : 0,
@@ -1283,7 +1426,8 @@ bool InstallHooks()
         g_origGetLocal != nullptr ? 1 : 0,
         g_getObserverTarget != nullptr ? 1 : 0,
         g_spectatorFilterHooked ? 1 : 0,
-        g_origIsSpectatorCheck != nullptr ? 1 : 0);
+        g_origIsSpectatorCheck != nullptr ? 1 : 0,
+        g_getEntityBySlotHooked ? 1 : 0);
     return true;
 }
 
@@ -1358,4 +1502,6 @@ void RadarPov_QueueEngineSetup(void (*queueCmd)(const char* cmd))
     // an observer target is unavailable.
     queueCmd("cl_radar_show_all_players_when_spectating 0");
     queueCmd("cl_radar_square_when_spectating 0");
+    // Competitive teammate palette (1 = colours, 2 = colours + letters).
+    queueCmd("cl_teammate_colors_show 1");
 }
