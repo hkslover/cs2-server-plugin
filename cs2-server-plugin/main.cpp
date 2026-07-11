@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <easywsclient.hpp>
 #include "icvar.h"
+#include "cs2_cvar_access.h"
 #include "cdll_interfaces.h"
 #include "record_status_bridge.h"
 #ifdef _WIN32
@@ -151,24 +152,46 @@ inline bool FileExists(const std::string& name) {
 
 static void UnhideCommandsAndCvars()
 {
-    uint64 flagsToRemove = (FCVAR_HIDDEN | FCVAR_DEVELOPMENTONLY);
+    if (g_pCVar == NULL) {
+        Log("VEngineCvar007 interface not found; skipping command/CVar unhide");
+        return;
+    }
 
-    ConCommandData* data = g_pCVar->GetConCommandData(ConCommandRef());
-    for (ConCommandRef concmd = ConCommandRef((uint16)0); concmd.GetRawData() != data; concmd = ConCommandRef(concmd.GetAccessIndex() + 1))
-    {
-        if (concmd.GetFlags() & flagsToRemove)
-        {
-            concmd.RemoveFlags(flagsToRemove);
+    // See cs2_cvar_access.h. CS2's legacy ConCommandRef / ConVarRef wrappers
+    // are no longer safe after the July 2026 update, so enumerate through the
+    // current VEngineCvar007 API instead (the same approach as advancedfx).
+    auto cvar = reinterpret_cast<CS2CvarAccess*>(g_pCVar);
+    const std::int64_t flagsToRemove = FCVAR_HIDDEN | FCVAR_DEVELOPMENTONLY;
+    std::size_t commandsUnhidden = 0;
+    std::size_t cvarsUnhidden = 0;
+    std::size_t commandCount = 0;
+    std::size_t cvarCount = 0;
+
+    for (std::size_t index = 0; index < CS2_MAX_VALID_CVAR_COUNT; ++index) {
+        CS2CommandEntry* command = cvar->GetCmd(index);
+        if (command == NULL || command->flags == 0x400) {
+            break;
+        }
+        ++commandCount;
+        if (command->flags & flagsToRemove) {
+            command->flags &= ~flagsToRemove;
+            ++commandsUnhidden;
         }
     }
 
-    for (ConVarRefAbstract ref(ConVarRef((uint16)0)); ref.IsValidRef(); ref = ConVarRefAbstract(ConVarRef(ref.GetAccessIndex() + 1)))
-    {
-        if (ref.GetFlags() & flagsToRemove)
-        {
-            ref.RemoveFlags(flagsToRemove);
+    for (std::size_t index = 0; index < CS2_MAX_VALID_CVAR_COUNT; ++index) {
+        CS2CvarEntry* entry = cvar->GetCvar(index);
+        if (entry == NULL) {
+            break;
+        }
+        ++cvarCount;
+        if (entry->flags & flagsToRemove) {
+            entry->flags &= ~flagsToRemove;
+            ++cvarsUnhidden;
         }
     }
+
+    Log("CVar unhide complete: commands %zu (%zu changed), cvars %zu (%zu changed)", commandCount, commandsUnhidden, cvarCount, cvarsUnhidden);
 }
 
 void PatchVTableEntry(void** vtable, int index, void* newFunc) {
@@ -528,17 +551,27 @@ void ConnectToWebsocketServerLoop() {
 
 bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
 {
+    Log("Source2ServerConfig001::Connect entered");
     factory = factoryFn;
+    if (serverConfigConnect == NULL) {
+        Log("Source2ServerConfig001 original Connect is null; refusing to continue plugin initialization");
+        return false;
+    }
     bool result = serverConfigConnect(appSystem, factory);
+    Log("Source2ServerConfig001::Connect returned %d", result);
 
     g_pCVar = (ICvar*)factory("VEngineCvar007", NULL);
+    Log("VEngineCvar007 lookup returned %p", g_pCVar);
     // Required to make the spec_lock_to_accountid command working since the 25/04/2024 update - it looks like the command has been hidden.
     // Also required to use the startmovie command.
     UnhideCommandsAndCvars();
 #ifdef CON_COMMAND_ENABLED
+    Log("Registering CSDM console commands");
     ConVar_Register();
+    Log("Registered CSDM console commands");
 #endif
 
+    Log("Starting WebSocket connection thread");
     wsConnectionThread = new std::thread(ConnectToWebsocketServerLoop);
 
     RestoreGameinfoFile();
