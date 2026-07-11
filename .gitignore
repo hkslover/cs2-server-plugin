@@ -4,3 +4,10 @@
 Debug/
 Release/
 *.dll
+
+# MinHook vendored sources only; ignore upstream packaging / CI noise
+cs2-server-plugin/deps/minhook/.editorconfig
+cs2-server-plugin/deps/minhook/.github/
+cs2-server-plugin/deps/minhook/.gitignore
+cs2-server-plugin/deps/minhook/CMakeLists.txt
+cs2-server-plugin/deps/minhook/cmake/
