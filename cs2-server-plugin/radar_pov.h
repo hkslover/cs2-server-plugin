@@ -2,17 +2,18 @@
 
 // First-person radar simulation for CS2 demo spectating.
 //
-// Real radar player update (client.dll) uses getLocal() as "self". getLocal
-// returns the local *player pawn* (validated with IsPlayerPawn @ vtable+0x4D8),
-// NOT a controller. Team / slot / isEnemy / spotted all run on that pawn.
+// Strategy (minimal upstream hooks only):
+// Real and demo radar share one client.dll path. During one radar update frame
+// we rewrite only the inputs that every live-vs-spectator branch re-queries:
 //
-// While spectating, getLocal is the spectator pawn, so after show-all is off
-// almost nobody is visible and radar_mode keeps spectator presentation. Fix:
-// during the complete radar update, make getLocal return the *observer target
-// pawn* (same type as live 1P self), including layout, sounds and icon state.
+//   • getLocal()              → observed player pawn
+//   • GetEntityBySlot(0/-1)   → observed player controller
+//                               (icon colour does not use getLocal)
+//   • engine demo/HLTV (+0x2B0) → false for this frame only
+//   • findPlayerBySlot(spectator) → nullptr (optional, hide freecam icon)
 //
-// If POV cannot be resolved, fall back to engine show-all so the radar is never
-// empty. Never pass a controller into pawn APIs (that AV'd Hook_RadarPlayers).
+// Native code then runs the normal live first-person layout, spots, and colours.
+// No icon-type rewrites, no forced ARGB, no colour-gate detours.
 //
 // Windows x64 only. Install is best-effort / non-fatal.
 
