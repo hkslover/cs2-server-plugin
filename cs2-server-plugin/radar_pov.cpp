@@ -30,6 +30,9 @@ thread_local int g_inRadarPlayerUpdate = 0;
 // Observer-target *pawn* used as self for this radar tick (same type as getLocal).
 thread_local void* g_povSelfPawn = nullptr;
 thread_local bool g_povActive = false;
+// Demo owns a separate spectator pawn / player slot. It is not part of a live
+// player's radar world and must not be allowed through the normal slot loop.
+thread_local int g_spectatorSlot = -1;
 
 std::atomic<int> g_faultRadarMode{0};
 std::atomic<int> g_faultRadarPlayers{0};
@@ -37,6 +40,7 @@ std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
 std::atomic<int> g_logPovFail{0};
+std::atomic<int> g_logSpectatorFilter{0};
 
 void Log(const char* fmt, ...)
 {
@@ -215,11 +219,18 @@ using RadarPlayersFn = void(__fastcall*)(void* radar);
 using GetLocalFn = void*(__fastcall*)();
 // getObs(localPawn) — first insn is mov rcx,[rcx+0x1220] (observer services on pawn).
 using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
+// Writes the pawn's player slot to outSlot (the radar function calls it right
+// after getLocal).
+using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
+// Resolves the player entity used by the per-slot radar loop.
+using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 
 RadarModeFn g_origRadarMode = nullptr;
 RadarPlayersFn g_origRadarPlayers = nullptr;
 GetLocalFn g_origGetLocal = nullptr;
 GetObserverTargetFn g_getObserverTarget = nullptr;
+GetPlayerSlotFn g_getPlayerSlot = nullptr;
+FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 
 bool g_minhookInitialized = false;
 
@@ -407,11 +418,27 @@ void* __fastcall Hook_GetLocal()
     return real;
 }
 
+// Make the demo-only spectator slot look absent to the radar's normal player
+// enumeration. This preserves the engine's own spotted and color paths for
+// every actual player, rather than trying to synthesize an icon state.
+void* __fastcall Hook_FindPlayerBySlot(int slot)
+{
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarPlayerUpdate > 0 && g_povActive &&
+        slot == g_spectatorSlot) {
+        if (g_logSpectatorFilter.fetch_add(1) == 0) {
+            Log("Radar POV: filtering demo spectator slot %d from player icons", slot);
+        }
+        return nullptr;
+    }
+    return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
+}
+
 void __fastcall Hook_RadarPlayers(void* radar)
 {
     const bool wantPov = g_enabled.load(std::memory_order_relaxed);
     g_povSelfPawn = nullptr;
     g_povActive = false;
+    g_spectatorSlot = -1;
 
     if (wantPov) {
         ++g_inRadarPlayerUpdate;
@@ -431,6 +458,21 @@ void __fastcall Hook_RadarPlayers(void* radar)
                 g_povSelfPawn = povPawn;
                 g_povActive = true;
                 SetShowAllFlag(radar, false);
+                if (g_getPlayerSlot != nullptr) {
+                    int spectatorSlot = -1;
+                    int povSlot = -1;
+                    __try {
+                        g_getPlayerSlot(realPawn, &spectatorSlot);
+                        g_getPlayerSlot(povPawn, &povSlot);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        spectatorSlot = -1;
+                    }
+                    // A normal live client has one pawn. In demo spectating,
+                    // only hide the distinct, extra spectator slot.
+                    if (spectatorSlot >= 0 && spectatorSlot != povSlot) {
+                        g_spectatorSlot = spectatorSlot;
+                    }
+                }
                 if (g_logPovOk.fetch_add(1) == 0) {
                     Log("Radar POV: active — self pawn %p -> observed pawn %p (show-all cleared)",
                         realPawn, povPawn);
@@ -478,6 +520,7 @@ void __fastcall Hook_RadarPlayers(void* radar)
     }
     g_povSelfPawn = nullptr;
     g_povActive = false;
+    g_spectatorSlot = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +747,8 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
 
     uintptr_t getLocalFn = earlyUnique.empty() ? 0 : earlyUnique[0];
     uintptr_t getObsFn = 0;
+    uintptr_t getPlayerSlotFn = 0;
+    uintptr_t findPlayerBySlotFn = 0;
     // getObs: contains imm32 0x1220 near the start.
     for (uintptr_t c : earlyUnique) {
         if (c == getLocalFn) {
@@ -725,11 +770,51 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         getObsFn = earlyUnique[2];
     }
 
+    // getSlot is immediately after getLocal:
+    //   lea rdx,[rsp+24h]; mov rcx,rax; call getSlot
+    // Do not use a fixed call index: the surrounding helper list changes more
+    // often than this small call-site shape.
+    {
+        const uint8_t* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
+        const size_t bodySize = ApproxFnSize(radarPlayersFn);
+        for (size_t i = 0; i + 13 < bodySize && i < 0x100; ++i) {
+            if (body[i] != 0x48 || body[i + 1] != 0x8D || body[i + 2] != 0x54 ||
+                body[i + 3] != 0x24 || body[i + 4] != 0x24 || body[i + 5] != 0x48 ||
+                body[i + 6] != 0x8B || body[i + 7] != 0xC8 || body[i + 8] != 0xE8) {
+                continue;
+            }
+            DecodeRel32Call(body + i + 8, radarPlayersFn + i + 8, getPlayerSlotFn);
+            break;
+        }
+    }
+
+    // Per-slot loop:
+    //   mov ecx,edi; call findPlayerBySlot; mov [rsp+58h],rax; mov rbx,rax; test rax,rax
+    // This is the narrowest safe interception point for excluding the extra
+    // demo spectator slot before it can create a radar icon.
+    {
+        const uint8_t* body = reinterpret_cast<const uint8_t*>(radarPlayersFn);
+        const size_t bodySize = ApproxFnSize(radarPlayersFn);
+        for (size_t i = 0; i + 18 < bodySize; ++i) {
+            if (body[i] != 0x8B || body[i + 1] != 0xCF || body[i + 2] != 0xE8 ||
+                body[i + 7] != 0x48 || body[i + 8] != 0x89 || body[i + 9] != 0x44 ||
+                body[i + 10] != 0x24 || body[i + 11] != 0x58 || body[i + 12] != 0x48 ||
+                body[i + 13] != 0x8B || body[i + 14] != 0xD8 || body[i + 15] != 0x48 ||
+                body[i + 16] != 0x85 || body[i + 17] != 0xC0) {
+                continue;
+            }
+            DecodeRel32Call(body + i + 2, radarPlayersFn + i + 2, findPlayerBySlotFn);
+            break;
+        }
+    }
+
     // Sanity: getLocal should be small and contain call to IsPlayerPawn path.
     if (getLocalFn != 0) {
-        Log("Radar POV: helpers getLocal=%p size=0x%zx getObs=%p size=0x%zx",
+        Log("Radar POV: helpers getLocal=%p size=0x%zx getSlot=%p getObs=%p size=0x%zx "
+            "findPlayerBySlot=%p",
             reinterpret_cast<void*>(getLocalFn), ApproxFnSize(getLocalFn),
-            reinterpret_cast<void*>(getObsFn), getObsFn ? ApproxFnSize(getObsFn) : 0);
+            reinterpret_cast<void*>(getPlayerSlotFn), reinterpret_cast<void*>(getObsFn),
+            getObsFn ? ApproxFnSize(getObsFn) : 0, reinterpret_cast<void*>(findPlayerBySlotFn));
     }
 
     if (getLocalFn == 0 || getObsFn == 0) {
@@ -742,6 +827,11 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     g_origRadarPlayers = reinterpret_cast<RadarPlayersFn>(radarPlayersFn);
     g_origGetLocal = getLocalFn != 0 ? reinterpret_cast<GetLocalFn>(getLocalFn) : nullptr;
     g_getObserverTarget = getObsFn != 0 ? reinterpret_cast<GetObserverTargetFn>(getObsFn) : nullptr;
+    g_getPlayerSlot =
+        getPlayerSlotFn != 0 ? reinterpret_cast<GetPlayerSlotFn>(getPlayerSlotFn) : nullptr;
+    g_origFindPlayerBySlot = findPlayerBySlotFn != 0
+        ? reinterpret_cast<FindPlayerBySlotFn>(findPlayerBySlotFn)
+        : nullptr;
     return true;
 }
 
@@ -768,6 +858,7 @@ bool InstallHooks()
     void* modeTarget = reinterpret_cast<void*>(g_origRadarMode);
     void* playersTarget = reinterpret_cast<void*>(g_origRadarPlayers);
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
+    void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
 
     if (!CreateAndEnableHook(modeTarget, reinterpret_cast<void*>(&Hook_RadarMode),
                              reinterpret_cast<void**>(&g_origRadarMode), "radar_mode")) {
@@ -796,11 +887,24 @@ bool InstallHooks()
         Log("Radar POV: getLocal/getObs unresolved — fail-safe show-all only");
     }
 
+    if (findPlayerBySlotTarget != nullptr && g_getPlayerSlot != nullptr) {
+        if (!CreateAndEnableHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
+                                 reinterpret_cast<void**>(&g_origFindPlayerBySlot),
+                                 "findPlayerBySlot")) {
+            Log("Radar POV: spectator-slot filter unavailable; retaining engine player list");
+            g_origFindPlayerBySlot = reinterpret_cast<FindPlayerBySlotFn>(findPlayerBySlotTarget);
+        }
+    } else {
+        Log("Radar POV: spectator-slot filter unresolved; retaining engine player list");
+    }
+
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d getLocal=%d getObs=%d) — self type is PAWN not controller",
+    Log("Radar POV: installed (enabled=%d getLocal=%d getObs=%d spectatorFilter=%d) — self type is "
+        "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0,
-        g_getObserverTarget != nullptr ? 1 : 0);
+        g_getObserverTarget != nullptr ? 1 : 0,
+        g_origFindPlayerBySlot != nullptr && g_getPlayerSlot != nullptr ? 1 : 0);
     return true;
 }
 
@@ -815,6 +919,8 @@ void UninstallHooks()
     g_origRadarPlayers = nullptr;
     g_origGetLocal = nullptr;
     g_getObserverTarget = nullptr;
+    g_getPlayerSlot = nullptr;
+    g_origFindPlayerBySlot = nullptr;
     g_installed.store(false, std::memory_order_release);
     Log("Radar POV: MinHook hooks removed");
 }

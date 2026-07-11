@@ -733,7 +733,7 @@ EXPORT void* CreateInterface(const char* pName, int* pReturnCode)
 CON_COMMAND(csdm_radar_pov, "Radar POV (true first-person while spectating): csdm_radar_pov 0|1")
 {
     if (args.ArgC() < 2) {
-        Log("csdm_radar_pov = %d installed=%d. Usage: csdm_radar_pov 0|1  (true POV = getLocal->observed controller)",
+        Log("csdm_radar_pov = %d installed=%d. Usage: csdm_radar_pov 0|1  (true POV = getLocal->observed pawn)",
             RadarPov_IsEnabled() ? 1 : 0,
             RadarPov_IsInstalled() ? 1 : 0);
         return;
@@ -764,7 +764,7 @@ CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
 {
     Log("Tick: %d", currentTick.load());
     Log("Is playing demo: %d", isPlayingDemo);
-    Log("Radar POV: enabled=%d installed=%d (getLocal->observed controller)",
+    Log("Radar POV: enabled=%d installed=%d (getLocal->observed pawn)",
         RadarPov_IsEnabled() ? 1 : 0,
         RadarPov_IsInstalled() ? 1 : 0);
 
