@@ -983,19 +983,49 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         : nullptr;
 
     // --- locate FUN_18085b540 (IsSpectatorCheck) ---
-    // Signature: cmp byte ptr [rbx+0x3E7], 1   →  80 BB E7 03 00 00 01
-    // This checks m_iTeamNum == 1 (SPECTATOR) and is unique in client.dll.
+    // FUN_18085b540 checks entity->m_iTeamNum == 1 plus 0x788/0x6E8 flags
+    // to decide whether the entity is a spectator.  A shorter function at a
+    // nearby RVA (FUN_1808490d0) also hits `cmp [rbx+0x3E7], 1` but returns a
+    // field value rather than a boolean; we must not hook that one.
+    //
+    // Unambiguous signature:
+    //   80 BB E7 03 00 00 01   cmp  byte ptr [rbx+0x3E7], 1
+    //   89 C7                  mov  edi, eax   (save FUN_1804eaad0 result)
+    //   75 38                  jnz  +0x38
+    //
+    // Prologue (validated after FindFunctionStart):
+    //   48 89 5C 24 08   mov  [rsp+8], rbx
+    //   57               push rdi
+    //   48 83 EC 20      sub  rsp, 0x20
+    //   48 8B D9         mov  rbx, rcx
     {
-        const uint8_t kIsSpecPattern[] = { 0x80, 0xBB, 0xE7, 0x03, 0x00, 0x00, 0x01 };
+        const uint8_t kIsSpecPattern[] = {
+            0x80, 0xBB, 0xE7, 0x03, 0x00, 0x00, 0x01,
+            0x89, 0xC7, 0x75
+        };
         const uint8_t* hit = FindBytes(client.base, client.size,
                                         kIsSpecPattern, sizeof(kIsSpecPattern));
         if (hit != nullptr) {
             const uintptr_t fnStart = FindFunctionStart(
                 client, reinterpret_cast<uintptr_t>(hit));
-            if (fnStart != 0 && IsInsideModule(client, fnStart)) {
+            const auto* prologue = reinterpret_cast<const uint8_t*>(fnStart);
+            const bool validPrologue =
+                fnStart != 0 && IsInsideModule(client, fnStart) &&
+                prologue[0] == 0x48 && prologue[1] == 0x89 &&
+                prologue[2] == 0x5C && prologue[3] == 0x24 &&
+                prologue[4] == 0x08 &&  // mov [rsp+8], rbx
+                prologue[5] == 0x57 &&   // push rdi
+                prologue[6] == 0x48 && prologue[7] == 0x83 &&
+                prologue[8] == 0xEC && prologue[9] == 0x20 &&  // sub rsp, 0x20
+                prologue[10] == 0x48 && prologue[11] == 0x8B &&
+                prologue[12] == 0xD9;  // mov rbx, rcx
+            if (validPrologue) {
                 g_origIsSpectatorCheck = reinterpret_cast<IsSpectatorCheckFn>(fnStart);
                 Log("Radar POV: IsSpectatorCheck @ %p (pattern @ %p)",
                     reinterpret_cast<void*>(fnStart), hit);
+            } else {
+                Log("Radar POV: IsSpectatorCheck pattern hit @ %p but prologue mismatch (fnStart=%p)",
+                    hit, reinterpret_cast<void*>(fnStart));
             }
         }
         if (g_origIsSpectatorCheck == nullptr) {
