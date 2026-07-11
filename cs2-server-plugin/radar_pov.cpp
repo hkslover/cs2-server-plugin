@@ -20,21 +20,12 @@
 namespace {
 
 // =============================================================================
-// Design: upstream inputs only (Ghidra-backed)
+// Design (Ghidra-backed): identity rewrite + teammate type + force ARGB
 //
-// Real/demo radar share one path. Competitive body colours (cl_teammate_color_*)
-// are painted in FUN_180e460e0 only when ALL of:
-//   A) bVar2 == false  → !IsSpectator(localCtrl) && !demo(+0x2B0)
-//   B) icon type == 9 (T) or 0xD (CT)   // NOT live-teammate type 0x11
-//   C) FUN_180863200 / FUN_1808494d0 allow m_iCompTeammateColor
-//
-// Identity rewrite (getLocal + GetEntityBySlot + demo) achieves A and live layout,
-// but then FUN_180e39320 assigns teammates type 0x11, so B fails → solid team colour.
-//
-// Hooks:
-//   radar_update, getLocal, GetEntityBySlot, demo/HLTV, findPlayerBySlot (optional)
-//   + SetRadarIconType (e39320): 0x11 → 9/0xD so native RGB path runs
-//   + colour gates 863200 / 8494d0 open during POV (no forced SetColor paint)
+// Hooks (7):
+//   radar_update, getLocal, GetEntityBySlot, demo/HLTV, findPlayerBySlot,
+//   SetRadarIconType (teammate 0x11→9/0xD), RadarIconColor (force cl_teammate_color_*)
+// Colour-gate hooks (863200 / 8494d0) removed — force-color covers them.
 // =============================================================================
 
 RadarPovLogFn g_log = nullptr;
