@@ -1,0 +1,44 @@
+name: Build Windows CS2 Plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Release x64 DLL
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Prepare output directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path "static/cs2" -Force | Out-Null
+
+      - name: Build Release x64
+        run: msbuild /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="${{ github.workspace }}\\static\\cs2\\" cs2-server-plugin.sln
+
+      - name: Verify DLL output
+        shell: pwsh
+        run: |
+          $dllPath = "static/cs2/server.dll"
+          if (!(Test-Path $dllPath)) {
+            throw "Build output not found: $dllPath"
+          }
+
+      - name: Upload server.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs2-server-plugin-windows-${{ github.sha }}
+          path: static/cs2/server.dll
+          if-no-files-found: error
+          retention-days: 14
