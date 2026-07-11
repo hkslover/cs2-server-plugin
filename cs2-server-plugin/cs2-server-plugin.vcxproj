@@ -113,7 +113,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>sdk/public/tier1;sdk/public/tier0;sdk/public;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>sdk/public/tier1;sdk/public/tier0;sdk/public;deps/minhook/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DisableSpecificWarnings>4146</DisableSpecificWarnings>
     </ClCompile>
     <Link>
@@ -129,7 +129,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;COMPILER_MSVC;COMPILER_MSVC64;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>Default</ConformanceMode>
-      <AdditionalIncludeDirectories>deps/hl2sdk/public/tier1;deps/hl2sdk/public/tier0;deps/hl2sdk/public;deps/json/include;deps/easywsclient;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>deps/hl2sdk/public/tier1;deps/hl2sdk/public/tier0;deps/hl2sdk/public;deps/json/include;deps/easywsclient;deps/minhook/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <DisableSpecificWarnings>4146</DisableSpecificWarnings>
     </ClCompile>
@@ -154,12 +154,17 @@ del *.pdb</Command>
   <ItemGroup>
     <ClInclude Include="cdll_interfaces.h" />
     <ClInclude Include="cs2_cvar_access.h" />
+    <ClInclude Include="deps\minhook\include\MinHook.h" />
     <ClInclude Include="radar_pov.h" />
     <ClInclude Include="record_status_bridge.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="deps\easywsclient\easywsclient.cpp" />
     <ClCompile Include="deps\hl2sdk\tier1\convar.cpp" />
+    <ClCompile Include="deps\minhook\src\buffer.c" />
+    <ClCompile Include="deps\minhook\src\hook.c" />
+    <ClCompile Include="deps\minhook\src\trampoline.c" />
+    <ClCompile Include="deps\minhook\src\hde\hde64.c" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="radar_pov.cpp" />
     <ClCompile Include="record_status_bridge.cpp" />

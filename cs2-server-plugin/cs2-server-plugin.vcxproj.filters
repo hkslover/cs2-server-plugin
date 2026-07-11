@@ -27,6 +27,9 @@
     <ClInclude Include="record_status_bridge.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="deps\minhook\include\MinHook.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
@@ -36,6 +39,18 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="deps\hl2sdk\tier1\convar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="deps\minhook\src\buffer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="deps\minhook\src\hook.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="deps\minhook\src\trampoline.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="deps\minhook\src\hde\hde64.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="radar_pov.cpp">
