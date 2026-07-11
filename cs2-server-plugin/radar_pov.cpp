@@ -47,6 +47,8 @@ std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logIsSpecCheckCalls{0};
 std::atomic<int> g_logGetEntityBySlot{0};
 std::atomic<int> g_logIconTypeFix{0};
+std::atomic<int> g_logCompColorApply{0};
+std::atomic<int> g_logCompColorSkip{0};
 
 void Log(const char* fmt, ...)
 {
@@ -264,6 +266,16 @@ using IsSpectatorCheckFn = uint8_t(__fastcall*)(void* entity);
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
 // FUN_180e39320(icon, playerTeam): selects radar icon panel type (stored at +0x16c).
 using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
+// FUN_180e460e0(radar, icon): per-player icon colour / class update.
+using RadarIconColorFn = void(__fastcall*)(void* radar, void* icon);
+// FUN_180863200(localTeam, iconTeam): gate for competitive colour paint.
+using ShouldApplyCompColorFn = uint8_t(__fastcall*)(int localTeam, int iconTeam);
+// FUN_1808494d0(controller): m_iCompTeammateColor or -1 when gated off.
+using GetCompTeammateColorFn = int(__fastcall*)(void* controller);
+// FUN_180849370(outArgb, colorIndex): fills cl_teammate_color_N ARGB.
+using GetCompColorArgbFn = uint32_t*(__fastcall*)(uint32_t* outArgb, int colorIndex);
+// FUN_180a732c0(playerIndex): controller (or related) for radar icon subject.
+using ResolvePlayerByIndexFn = void*(__fastcall*)(int playerIndex);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
 RadarPresentationFn g_origRadarPresentation = nullptr;
@@ -275,15 +287,30 @@ FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 IsSpectatorCheckFn g_origIsSpectatorCheck = nullptr;
 GetEntityBySlotFn g_origGetEntityBySlot = nullptr;
 SetRadarIconTypeFn g_origSetRadarIconType = nullptr;
+RadarIconColorFn g_origRadarIconColor = nullptr;
+ShouldApplyCompColorFn g_origShouldApplyCompColor = nullptr;
+GetCompTeammateColorFn g_origGetCompTeammateColor = nullptr;
+GetCompColorArgbFn g_getCompColorArgb = nullptr;
+ResolvePlayerByIndexFn g_resolvePlayerByIndex = nullptr;
 
 bool g_minhookInitialized = false;
 bool g_spectatorFilterHooked = false;
 bool g_getEntityBySlotHooked = false;
 bool g_iconTypeHooked = false;
+bool g_iconColorHooked = false;
+bool g_compColorGateHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
 
 // Icon type field written by FUN_180e39320 / read by FUN_180e460e0 colour paint.
 constexpr ptrdiff_t kIconTypeOffset = 0x16c;
+// Player index used by FUN_180a732c0 / team-counter lookup.
+constexpr ptrdiff_t kIconPlayerIndexOffset = 0x158;
+// Rate-limit timestamp; set old to force a colour refresh each POV frame.
+constexpr ptrdiff_t kIconColorTimeOffset = 0x14c;
+// m_iTeamNum on controller (byte).
+constexpr ptrdiff_t kControllerTeamOffset = 0x3E7;
+// m_iCompTeammateColor on CCSPlayerController.
+constexpr ptrdiff_t kCompTeammateColorOffset = 0x850;
 // Live-FOG teammate icon type (no competitive RGB paint in e460e0).
 constexpr int kIconTypeLiveTeammate = 0x11;
 // Spectator-style types that e460e0 live RGB path actually paints.
@@ -291,6 +318,11 @@ constexpr int kIconTypeTerrorist = 9;
 constexpr int kIconTypeCT = 0xd;
 constexpr int kTeamT = 3;
 constexpr int kTeamCT = 2;
+// Panels that e460e0 paints with competitive ARGB (T set then CT set).
+constexpr ptrdiff_t kCompColorPanelOffs[] = {0x60, 0x68, 0x70, 0x80, 0x88, 0x90};
+// Panorama style vtable: +0x230 get style-ish, +0x188 set color.
+constexpr size_t kPanelGetStyleVtableByteOff = 0x230;
+constexpr size_t kStyleSetColorVtableByteOff = 0x188;
 
 // getLocal validates return with vtable+0x4D8 = IsPlayerPawn (index 155).
 constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
@@ -688,6 +720,187 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // ignore
+    }
+}
+
+// FUN_180863200: engine refuses competitive colours when max-players gate /
+// game-rules / mode checks fail.  During POV, allow paint for T/CT icon teams.
+uint8_t __fastcall Hook_ShouldApplyCompColor(int localTeam, int iconTeam)
+{
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
+        (iconTeam == kTeamT || iconTeam == kTeamCT)) {
+        return 1;
+    }
+    return g_origShouldApplyCompColor != nullptr ? g_origShouldApplyCompColor(localTeam, iconTeam)
+                                                 : 0;
+}
+
+// FUN_1808494d0: bypass game-rules / mode gate; return m_iCompTeammateColor.
+int __fastcall Hook_GetCompTeammateColor(void* controller)
+{
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
+        controller != nullptr) {
+        __try {
+            const int c =
+                *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(controller) +
+                                        kCompTeammateColorOffset);
+            if (c >= 0 && c <= 4) {
+                return c;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // fall through
+        }
+    }
+    return g_origGetCompTeammateColor != nullptr ? g_origGetCompTeammateColor(controller) : -1;
+}
+
+bool SetIconPanelColor(void* icon, ptrdiff_t panelOff, uint32_t* argb)
+{
+    if (icon == nullptr || argb == nullptr) {
+        return false;
+    }
+    __try {
+        void* panel = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(icon) + panelOff);
+        if (panel == nullptr) {
+            return false;
+        }
+        void* inner = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(panel) + 8);
+        if (inner == nullptr) {
+            return false;
+        }
+        void** vtable = *reinterpret_cast<void***>(inner);
+        if (vtable == nullptr) {
+            return false;
+        }
+        using GetStyleFn = void*(__fastcall*)(void*);
+        auto getStyle =
+            reinterpret_cast<GetStyleFn>(vtable[kPanelGetStyleVtableByteOff / sizeof(void*)]);
+        if (getStyle == nullptr) {
+            return false;
+        }
+        void* style = getStyle(inner);
+        if (style == nullptr) {
+            return false;
+        }
+        void** styleVt = *reinterpret_cast<void***>(style);
+        if (styleVt == nullptr) {
+            return false;
+        }
+        using SetColorFn = void(__fastcall*)(void*, uint32_t*);
+        auto setColor =
+            reinterpret_cast<SetColorFn>(styleVt[kStyleSetColorVtableByteOff / sizeof(void*)]);
+        if (setColor == nullptr) {
+            return false;
+        }
+        setColor(style, argb);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Force-apply cl_teammate_color_* ARGB onto the same panels the engine paints in
+// FUN_180e460e0.  Used after the native call so rate-limit / mode gates cannot
+// leave teammates on solid team orange/blue.
+void ForceApplyCompColors(void* icon)
+{
+    if (icon == nullptr || g_getCompColorArgb == nullptr || !g_povActive) {
+        return;
+    }
+
+    void* controller = nullptr;
+    int playerIndex = -1;
+    int colorIdx = -1;
+    int playerTeam = 0;
+    int localTeam = 0;
+
+    __try {
+        playerIndex =
+            *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(icon) + kIconPlayerIndexOffset);
+        if (g_resolvePlayerByIndex != nullptr && playerIndex != -1) {
+            controller = g_resolvePlayerByIndex(playerIndex);
+        }
+        if (controller == nullptr) {
+            const int n = g_logCompColorSkip.fetch_add(1);
+            if (n == 0) {
+                Log("Radar POV: comp-colour skip — no controller for playerIndex=%d", playerIndex);
+            }
+            return;
+        }
+
+        playerTeam = static_cast<unsigned char>(
+            *(reinterpret_cast<uint8_t*>(controller) + kControllerTeamOffset));
+        if (playerTeam != kTeamT && playerTeam != kTeamCT) {
+            return;
+        }
+
+        // Only recolour teammates of the observed player (enemies stay native).
+        if (g_origGetEntityBySlot != nullptr && g_povSelfSlot >= 0) {
+            void* localCtrl = g_origGetEntityBySlot(g_povSelfSlot);
+            if (localCtrl != nullptr) {
+                localTeam = static_cast<unsigned char>(
+                    *(reinterpret_cast<uint8_t*>(localCtrl) + kControllerTeamOffset));
+                if ((localTeam == kTeamT || localTeam == kTeamCT) && playerTeam != localTeam) {
+                    return;
+                }
+            }
+        }
+
+        colorIdx = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(controller) +
+                                           kCompTeammateColorOffset);
+        if (colorIdx < 0 || colorIdx > 4) {
+            // Demo entities sometimes leave the netvar unset; fall back to a
+            // stable per-player bucket so icons are still distinct.
+            colorIdx = playerIndex >= 0 ? (playerIndex % 5) : 0;
+        }
+
+        uint32_t argb = 0;
+        g_getCompColorArgb(&argb, colorIdx);
+        if (argb == 0) {
+            return;
+        }
+
+        int painted = 0;
+        for (ptrdiff_t off : kCompColorPanelOffs) {
+            if (SetIconPanelColor(icon, off, &argb)) {
+                ++painted;
+            }
+        }
+
+        const int n = g_logCompColorApply.fetch_add(1);
+        if (n == 0 || n == 25) {
+            Log("Radar POV: comp-colour apply idx=%d argb=0x%08X team=%d localTeam=%d panels=%d "
+                "playerIndex=%d",
+                colorIdx, argb, playerTeam, localTeam, painted, playerIndex);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (g_logCompColorSkip.fetch_add(1) == 0) {
+            Log("Radar POV: EXCEPTION in ForceApplyCompColors");
+        }
+    }
+}
+
+// FUN_180e460e0: force a colour refresh every POV frame, then ensure competitive
+// ARGB is written even when native gates no-op.
+void __fastcall Hook_RadarIconColor(void* radar, void* icon)
+{
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive &&
+        icon != nullptr) {
+        __try {
+            // Native live path rate-limits on this float; keep it stale so paint runs.
+            *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(icon) + kIconColorTimeOffset) =
+                -1.0e6f;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // ignore
+        }
+    }
+
+    if (g_origRadarIconColor != nullptr) {
+        g_origRadarIconColor(radar, icon);
+    }
+
+    if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive) {
+        ForceApplyCompColors(icon);
     }
 }
 
@@ -1391,6 +1604,149 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         }
     }
 
+    // --- FUN_180e460e0 (RadarIconColor) + helpers used for forced paint ---
+    // Icon colour body: xor ecx,ecx; call GetEntityBySlot; ... call IsSpectatorCheck
+    {
+        if (g_origGetEntityBySlot != nullptr && g_origIsSpectatorCheck != nullptr &&
+            client.base != nullptr) {
+            const uintptr_t getEnt = reinterpret_cast<uintptr_t>(g_origGetEntityBySlot);
+            const uintptr_t isSpec = reinterpret_cast<uintptr_t>(g_origIsSpectatorCheck);
+            const uintptr_t base = reinterpret_cast<uintptr_t>(client.base);
+            for (size_t i = 0; i + 5 < client.size; ++i) {
+                if (client.base[i] != 0xE8) {
+                    continue;
+                }
+                uintptr_t t = 0;
+                if (!DecodeRel32Call(client.base + i, base + i, t) || t != isSpec) {
+                    continue;
+                }
+                const size_t isSpecCall = i;
+                const size_t backStart = isSpecCall > 0x40 ? isSpecCall - 0x40 : 0;
+                bool sawGetEnt = false;
+                for (size_t j = backStart; j + 5 < isSpecCall; ++j) {
+                    uintptr_t gt = 0;
+                    if (DecodeRel32Call(client.base + j, base + j, gt) && gt == getEnt) {
+                        sawGetEnt = true;
+                        break;
+                    }
+                }
+                if (!sawGetEnt) {
+                    continue;
+                }
+                // Walk back to TEST RDX,RDX prologue (not accepted by LooksLikePrologue).
+                uintptr_t fn = 0;
+                const size_t maxBack = isSpecCall > 0x120 ? 0x120 : isSpecCall;
+                for (size_t back = 0x20; back < maxBack; ++back) {
+                    const uint8_t* cand = client.base + isSpecCall - back;
+                    if (cand[0] != 0x48 || cand[1] != 0x85 || cand[2] != 0xD2) {
+                        continue;
+                    }
+                    if (isSpecCall > back) {
+                        const uint8_t prev = client.base[isSpecCall - back - 1];
+                        if (prev != 0xCC && prev != 0x90 && prev != 0xC3 && back < 0x80) {
+                            continue;
+                        }
+                    }
+                    fn = base + isSpecCall - back;
+                    break;
+                }
+                if (fn == 0) {
+                    continue;
+                }
+                const auto* p = reinterpret_cast<const uint8_t*>(fn);
+                g_origRadarIconColor = reinterpret_cast<RadarIconColorFn>(fn);
+                Log("Radar POV: RadarIconColor @ %p", reinterpret_cast<void*>(fn));
+
+                // Extract FUN_180a732c0: mov ecx,[rsi+0x158]; call
+                const size_t fnSize = ApproxFnSize(fn);
+                for (size_t k = 0; k + 10 < fnSize && k < 0x200; ++k) {
+                    if (p[k] == 0x8B && p[k + 1] == 0x8E && p[k + 2] == 0x58 &&
+                        p[k + 3] == 0x01 && p[k + 4] == 0x00 && p[k + 5] == 0x00 &&
+                        p[k + 6] == 0xE8) {
+                        uintptr_t resolveFn = 0;
+                        if (DecodeRel32Call(p + k + 6, fn + k + 6, resolveFn) &&
+                            IsInsideModule(client, resolveFn)) {
+                            g_resolvePlayerByIndex =
+                                reinterpret_cast<ResolvePlayerByIndexFn>(resolveFn);
+                            Log("Radar POV: ResolvePlayerByIndex @ %p",
+                                reinterpret_cast<void*>(resolveFn));
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        if (g_origRadarIconColor == nullptr) {
+            Log("Radar POV: RadarIconColor not found; cannot force competitive ARGB");
+        }
+    }
+
+    // FUN_180849370 — cl_teammate_color_N ARGB table
+    // 40 53 48 83 EC 20 48 8B D9 83 FA FF 7D
+    {
+        const uint8_t kPat[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
+                                0x83, 0xFA, 0xFF, 0x7D};
+        const uint8_t* hit = FindBytes(client.base, client.size, kPat, sizeof(kPat));
+        if (hit != nullptr) {
+            g_getCompColorArgb =
+                reinterpret_cast<GetCompColorArgbFn>(reinterpret_cast<uintptr_t>(hit));
+            Log("Radar POV: GetCompColorArgb @ %p", hit);
+        } else {
+            Log("Radar POV: GetCompColorArgb not found");
+        }
+    }
+
+    // FUN_1808494d0 — returns [rcx+0x850] when game-rules/mode allow
+    // 40 53 48 83 EC 20 48 8B D9 48 8B 0D ... E8 ... 84 C0 74 ... 8B 83 50 08 00 00
+    {
+        if (client.base != nullptr) {
+            for (size_t i = 0; i + 32 <= client.size; ++i) {
+                const uint8_t* p = client.base + i;
+                if (p[0] != 0x40 || p[1] != 0x53 || p[2] != 0x48 || p[3] != 0x83 ||
+                    p[4] != 0xEC || p[5] != 0x20 || p[6] != 0x48 || p[7] != 0x8B ||
+                    p[8] != 0xD9 || p[9] != 0x48 || p[10] != 0x8B || p[11] != 0x0D) {
+                    continue;
+                }
+                // Find mov eax,[rbx+0x850] within the short function.
+                bool has850 = false;
+                for (size_t j = 0; j + 6 < 0x40; ++j) {
+                    if (p[j] == 0x8B && p[j + 1] == 0x83 && p[j + 2] == 0x50 &&
+                        p[j + 3] == 0x08 && p[j + 4] == 0x00 && p[j + 5] == 0x00) {
+                        has850 = true;
+                        break;
+                    }
+                }
+                if (!has850) {
+                    continue;
+                }
+                g_origGetCompTeammateColor =
+                    reinterpret_cast<GetCompTeammateColorFn>(reinterpret_cast<uintptr_t>(p));
+                Log("Radar POV: GetCompTeammateColor @ %p", p);
+                break;
+            }
+        }
+        if (g_origGetCompTeammateColor == nullptr) {
+            Log("Radar POV: GetCompTeammateColor not found");
+        }
+    }
+
+    // FUN_180863200 — competitive colour gate (localTeam, iconTeam)
+    // 48 89 5C 24 10 57 48 83 EC 20 8B FA 8B D9 BA FF FF FF FF 48 8D 0D
+    {
+        const uint8_t kPat[] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC,
+                                0x20, 0x8B, 0xFA, 0x8B, 0xD9, 0xBA, 0xFF, 0xFF, 0xFF, 0xFF,
+                                0x48, 0x8D, 0x0D};
+        const uint8_t* hit = FindBytes(client.base, client.size, kPat, sizeof(kPat));
+        if (hit != nullptr) {
+            g_origShouldApplyCompColor =
+                reinterpret_cast<ShouldApplyCompColorFn>(reinterpret_cast<uintptr_t>(hit));
+            Log("Radar POV: ShouldApplyCompColor @ %p", hit);
+        } else {
+            Log("Radar POV: ShouldApplyCompColor not found");
+        }
+    }
+
     return true;
 }
 
@@ -1406,9 +1762,16 @@ void ResetResolvedRadarState()
     g_origIsSpectatorCheck = nullptr;
     g_origGetEntityBySlot = nullptr;
     g_origSetRadarIconType = nullptr;
+    g_origRadarIconColor = nullptr;
+    g_origShouldApplyCompColor = nullptr;
+    g_origGetCompTeammateColor = nullptr;
+    g_getCompColorArgb = nullptr;
+    g_resolvePlayerByIndex = nullptr;
     g_spectatorFilterHooked = false;
     g_getEntityBySlotHooked = false;
     g_iconTypeHooked = false;
+    g_iconColorHooked = false;
+    g_compColorGateHooked = false;
     g_radarDemoStateGlobalSlot = 0;
     g_radarShowAllFlagOffset = 0;
     g_installed.store(false, std::memory_order_release);
@@ -1556,8 +1919,45 @@ bool InstallHooks()
         Log("Radar POV: SetRadarIconType unresolved; type 0x11 may block RGB colours");
     }
 
+    // Open native competitive-colour gates during POV.
+    if (g_origShouldApplyCompColor != nullptr) {
+        if (CreateAndEnableHook(reinterpret_cast<void*>(g_origShouldApplyCompColor),
+                                reinterpret_cast<void*>(&Hook_ShouldApplyCompColor),
+                                reinterpret_cast<void**>(&g_origShouldApplyCompColor),
+                                "shouldApplyCompColor")) {
+            g_compColorGateHooked = true;
+        } else {
+            Log("Radar POV: ShouldApplyCompColor hook failed");
+        }
+    }
+    if (g_origGetCompTeammateColor != nullptr) {
+        if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origGetCompTeammateColor),
+                                 reinterpret_cast<void*>(&Hook_GetCompTeammateColor),
+                                 reinterpret_cast<void**>(&g_origGetCompTeammateColor),
+                                 "getCompTeammateColor")) {
+            Log("Radar POV: GetCompTeammateColor hook failed");
+        }
+    }
+
+    // Final paint: force competitive ARGB onto icon panels after native update.
+    if (g_origRadarIconColor != nullptr && g_getCompColorArgb != nullptr) {
+        if (CreateAndEnableHook(reinterpret_cast<void*>(g_origRadarIconColor),
+                                reinterpret_cast<void*>(&Hook_RadarIconColor),
+                                reinterpret_cast<void**>(&g_origRadarIconColor),
+                                "radarIconColor")) {
+            g_iconColorHooked = true;
+        } else {
+            Log("Radar POV: RadarIconColor hook failed; cannot force competitive ARGB");
+        }
+    } else {
+        Log("Radar POV: RadarIconColor/ARGB helpers incomplete (iconColor=%p argb=%p resolve=%p)",
+            reinterpret_cast<void*>(g_origRadarIconColor),
+            reinterpret_cast<void*>(g_getCompColorArgb),
+            reinterpret_cast<void*>(g_resolvePlayerByIndex));
+    }
+
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d getEntityBySlot=%d iconType=%d) — self type is "
+    Log("Radar POV: installed (enabled=%d radarUpdate=%d presentation=%d demoState=%d getLocal=%d getObs=%d spectatorFilter=%d isSpecCheck=%d getEntityBySlot=%d iconType=%d compGate=%d iconColor=%d) — self type is "
         "PAWN not controller",
         g_enabled.load() ? 1 : 0,
         g_origRadarUpdate != nullptr ? 1 : 0,
@@ -1568,7 +1968,9 @@ bool InstallHooks()
         g_spectatorFilterHooked ? 1 : 0,
         g_origIsSpectatorCheck != nullptr ? 1 : 0,
         g_getEntityBySlotHooked ? 1 : 0,
-        g_iconTypeHooked ? 1 : 0);
+        g_iconTypeHooked ? 1 : 0,
+        g_compColorGateHooked ? 1 : 0,
+        g_iconColorHooked ? 1 : 0);
     return true;
 }
 
