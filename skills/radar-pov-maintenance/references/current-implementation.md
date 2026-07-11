@@ -34,6 +34,8 @@ outer radar update
        -> return observed pawn instead of spectator pawn
   -> demo/HLTV state query
        -> return false only inside the POV scope
+  -> IsSpectatorCheck (icon colour gate; entity often slot-0 spectator)
+       -> return false only inside the POV scope  → per-player colours
   -> player lookup by slot
        -> hide the demo spectator slot
   -> native presentation selector and renderer
@@ -57,6 +59,8 @@ relationships and surrounding instruction shapes over the numeric values.
 | Observer target | RVA `0x813F30` | Find observer-services access; the known path used pawn observer services at `+0x1220`. |
 | Demo/HLTV check | global `DAT_18239F7F8`, virtual `+0x2B0` | Trace calls in radar mode and player-class presentation; return false only during scoped POV updates. |
 | Show-all/spotted field | formerly `radar + 0x17760` | Extract from the current `and byte ptr [radar + offset], ~1`-style instruction; do not hard-code it. |
+| IsSpectatorCheck (colours) | RVA `0x85B540` | Icon renderer `FUN_180e460e0` calls this on `FUN_180926920(0)` (slot 0 controller, not getLocal). Both this and demo/HLTV must be false for live per-player colour classes (`controller+0x850`). Prologue: `mov [rsp+8],rbx; push rdi; sub rsp,20h; mov rbx,rcx; lea rcx,[rip]; call; cmp [rbx+0x3E7],1`. Do **not** match only `cmp [rbx+0x3E7],1` (neighbour `FUN_1808490d0` shares it). `mov edi,eax` may be `8B F8` or `89 C7`. |
+| Per-player icon renderer | RVA `0xE460E0` | Called from player update; branches on IsSpectatorCheck + demo state into team-colour vs per-player colour paths. |
 
 `ResolveRadarFunctions` intentionally uses several byte checks. They are
 feature-code signatures plus structural validation: they identify code/data
@@ -69,10 +73,16 @@ the feature safely and prompt re-analysis, not crash the game.
 The exact addresses vary. A good test log should show that the relevant hooks
 resolved and installed, then show scoped transitions equivalent to:
 
+- install line includes `isSpecCheck=1` (not `0`);
+- `IsSpectatorCheck @ ... (prologue+team-cmp mask)` (or a listed fallback) appears once;
+- `IsSpectatorCheck forced 0 (call #1, ...)` appears after POV becomes active;
 - native demo/HLTV state changes from `1 -> 0` during the radar update;
 - live-POV selector receives the local POV state expected for native rotation;
 - spectator slot `0` (or the current spectator slot) is filtered;
 - no hook exceptions, invalid-target messages, or game crash.
+
+If `isSpecCheck=0`, teammates stay on team colours (T orange / CT blue) even when
+rotation and spotting already look first-person — re-resolve `IsSpectatorCheck`.
 
 Logs alone do not prove the rendering contract. Always observe a rotating
 first-person demo scene containing teammates, a seen enemy, a heard enemy, and

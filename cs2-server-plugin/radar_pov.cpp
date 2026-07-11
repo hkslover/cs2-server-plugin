@@ -42,6 +42,7 @@ std::atomic<int> g_logPovFail{0};
 std::atomic<int> g_logSpectatorFilter{0};
 std::atomic<int> g_logPresentationOverride{0};
 std::atomic<int> g_logDemoStateOverride{0};
+std::atomic<int> g_logIsSpecCheckCalls{0};
 
 void Log(const char* fmt, ...)
 {
@@ -583,9 +584,17 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
 // or 0x788/0x6E8 flags).  The per-player icon renderer calls it alongside the
 // engine demo-state check; both must return false for the engine to select the
 // live per-player colour classes rather than team-colour classes.
+//
+// Note: the icon renderer obtains "local" via FUN_180926920(0) (slot 0 / demo
+// spectator controller), NOT getLocal.  So Hook_GetLocal alone never steers this
+// check — we must force false while a POV radar frame is active.
 uint8_t __fastcall Hook_IsSpectatorCheck(void* entity)
 {
     if (g_enabled.load(std::memory_order_relaxed) && g_inRadarUpdate > 0 && g_povActive) {
+        const int n = g_logIsSpecCheckCalls.fetch_add(1);
+        if (n == 0 || n == 50 || n == 500) {
+            Log("Radar POV: IsSpectatorCheck forced 0 (call #%d, entity=%p)", n + 1, entity);
+        }
         return 0;
     }
     return g_origIsSpectatorCheck != nullptr ? g_origIsSpectatorCheck(entity) : 0;
@@ -983,51 +992,152 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
         : nullptr;
 
     // --- locate FUN_18085b540 (IsSpectatorCheck) ---
-    // FUN_18085b540 checks entity->m_iTeamNum == 1 plus 0x788/0x6E8 flags
-    // to decide whether the entity is a spectator.  A shorter function at a
-    // nearby RVA (FUN_1808490d0) also hits `cmp [rbx+0x3E7], 1` but returns a
-    // field value rather than a boolean; we must not hook that one.
+    // Per-player icon colour path (FUN_180e460e0):
+    //   entity = FUN_180926920(0);          // slot 0 = demo spectator controller
+    //   if (!IsSpectatorCheck(entity) && !demoState())
+    //       bVar2 = false;  // live: controller+0x850 colour index
+    //   else
+    //       bVar2 = true;   // spectator: team colour classes
     //
-    // Unambiguous signature:
-    //   80 BB E7 03 00 00 01   cmp  byte ptr [rbx+0x3E7], 1
-    //   89 C7                  mov  edi, eax   (save FUN_1804eaad0 result)
-    //   75 38                  jnz  +0x38
+    // A shorter neighbour (FUN_1808490d0) also hits `cmp [rbx+0x3E7],1` but is
+    // not the boolean spectator predicate — validate the full prologue.
     //
-    // Prologue (validated after FindFunctionStart):
-    //   48 89 5C 24 08   mov  [rsp+8], rbx
-    //   57               push rdi
-    //   48 83 EC 20      sub  rsp, 0x20
-    //   48 8B D9         mov  rbx, rcx
+    // MSVC encodes `mov edi,eax` as either `8B F8` or `89 C7`.  The previous
+    // pattern only accepted `89 C7` and therefore missed the live client
+    // (PE 0x6A500273 uses `8B F8`).  Prefer the unique prologue+body mask.
     {
-        const uint8_t kIsSpecPattern[] = {
-            0x80, 0xBB, 0xE7, 0x03, 0x00, 0x00, 0x01,
-            0x89, 0xC7, 0x75
+        auto tryAcceptIsSpec = [&](uintptr_t fnStart, const char* how) -> bool {
+            if (fnStart == 0 || !IsInsideModule(client, fnStart)) {
+                return false;
+            }
+            const auto* p = reinterpret_cast<const uint8_t*>(fnStart);
+            // 48 89 5C 24 08 57 48 83 EC 20 48 8B D9
+            if (!(p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C && p[3] == 0x24 &&
+                  p[4] == 0x08 && p[5] == 0x57 && p[6] == 0x48 && p[7] == 0x83 &&
+                  p[8] == 0xEC && p[9] == 0x20 && p[10] == 0x48 && p[11] == 0x8B &&
+                  p[12] == 0xD9)) {
+                return false;
+            }
+            // Body must still compare m_iTeamNum (== entity+0x3E7).
+            bool hasTeamCmp = false;
+            const size_t scan = ApproxFnSize(fnStart);
+            for (size_t i = 0; i + 7 <= scan && i < 0x80; ++i) {
+                if (p[i] == 0x80 && p[i + 1] == 0xBB && p[i + 2] == 0xE7 &&
+                    p[i + 3] == 0x03 && p[i + 4] == 0x00 && p[i + 5] == 0x00 &&
+                    p[i + 6] == 0x01) {
+                    hasTeamCmp = true;
+                    break;
+                }
+            }
+            if (!hasTeamCmp) {
+                return false;
+            }
+            g_origIsSpectatorCheck = reinterpret_cast<IsSpectatorCheckFn>(fnStart);
+            Log("Radar POV: IsSpectatorCheck @ %p (%s)", reinterpret_cast<void*>(fnStart), how);
+            return true;
         };
-        const uint8_t* hit = FindBytes(client.base, client.size,
-                                        kIsSpecPattern, sizeof(kIsSpecPattern));
-        if (hit != nullptr) {
-            const uintptr_t fnStart = FindFunctionStart(
-                client, reinterpret_cast<uintptr_t>(hit));
-            const auto* prologue = reinterpret_cast<const uint8_t*>(fnStart);
-            const bool validPrologue =
-                fnStart != 0 && IsInsideModule(client, fnStart) &&
-                prologue[0] == 0x48 && prologue[1] == 0x89 &&
-                prologue[2] == 0x5C && prologue[3] == 0x24 &&
-                prologue[4] == 0x08 &&  // mov [rsp+8], rbx
-                prologue[5] == 0x57 &&   // push rdi
-                prologue[6] == 0x48 && prologue[7] == 0x83 &&
-                prologue[8] == 0xEC && prologue[9] == 0x20 &&  // sub rsp, 0x20
-                prologue[10] == 0x48 && prologue[11] == 0x8B &&
-                prologue[12] == 0xD9;  // mov rbx, rcx
-            if (validPrologue) {
-                g_origIsSpectatorCheck = reinterpret_cast<IsSpectatorCheckFn>(fnStart);
-                Log("Radar POV: IsSpectatorCheck @ %p (pattern @ %p)",
-                    reinterpret_cast<void*>(fnStart), hit);
-            } else {
-                Log("Radar POV: IsSpectatorCheck pattern hit @ %p but prologue mismatch (fnStart=%p)",
-                    hit, reinterpret_cast<void*>(fnStart));
+
+        // Primary: unique masked prologue —
+        //   mov [rsp+8],rbx; push rdi; sub rsp,20h; mov rbx,rcx;
+        //   lea rcx,[rip+disp]; call ...; cmp byte ptr [rbx+3E7h],1
+        // RIP-relative LEA/CALL displacements are wildcards.
+        if (client.base != nullptr && client.size >= 32) {
+            for (size_t i = 0; i + 32 <= client.size; ++i) {
+                const uint8_t* p = client.base + i;
+                if (p[0] != 0x48 || p[1] != 0x89 || p[2] != 0x5C || p[3] != 0x24 ||
+                    p[4] != 0x08 || p[5] != 0x57 || p[6] != 0x48 || p[7] != 0x83 ||
+                    p[8] != 0xEC || p[9] != 0x20 || p[10] != 0x48 || p[11] != 0x8B ||
+                    p[12] != 0xD9 || p[13] != 0x48 || p[14] != 0x8D || p[15] != 0x0D ||
+                    p[20] != 0xE8 || p[25] != 0x80 || p[26] != 0xBB || p[27] != 0xE7 ||
+                    p[28] != 0x03 || p[29] != 0x00 || p[30] != 0x00 || p[31] != 0x01) {
+                    continue;
+                }
+                if (tryAcceptIsSpec(reinterpret_cast<uintptr_t>(p), "prologue+team-cmp mask")) {
+                    break;
+                }
             }
         }
+
+        // Fallback: cmp [rbx+0x3E7],1 followed by either mov-edi encoding then jnz.
+        //   80 BB E7 03 00 00 01  (8B F8 | 89 C7)  75 xx
+        if (g_origIsSpectatorCheck == nullptr && client.base != nullptr) {
+            const uint8_t kTeamCmp[] = {0x80, 0xBB, 0xE7, 0x03, 0x00, 0x00, 0x01};
+            const uint8_t* search = client.base;
+            size_t remaining = client.size;
+            while (remaining >= sizeof(kTeamCmp) + 3) {
+                const uint8_t* hit =
+                    FindBytes(search, remaining, kTeamCmp, sizeof(kTeamCmp));
+                if (hit == nullptr) {
+                    break;
+                }
+                const uint8_t* after = hit + sizeof(kTeamCmp);
+                const bool movEdi =
+                    (after[0] == 0x8B && after[1] == 0xF8) ||  // mov edi, eax
+                    (after[0] == 0x89 && after[1] == 0xC7);    // mov edi, eax (alt)
+                if (movEdi && after[2] == 0x75) {
+                    const uintptr_t fnStart =
+                        FindFunctionStart(client, reinterpret_cast<uintptr_t>(hit));
+                    if (tryAcceptIsSpec(fnStart, "team-cmp + mov edi,eax + jnz")) {
+                        break;
+                    }
+                    Log("Radar POV: IsSpectatorCheck candidate @ %p rejected (fnStart=%p)",
+                        hit, reinterpret_cast<void*>(fnStart));
+                }
+                const size_t advanced =
+                    static_cast<size_t>(hit - client.base) + 1;
+                if (advanced >= client.size) {
+                    break;
+                }
+                search = client.base + advanced;
+                remaining = client.size - advanced;
+            }
+        }
+
+        // Structural fallback: icon renderer (called from radar players) does
+        //   xor ecx,ecx; call getEntityBySlot; ...; call IsSpectatorCheck
+        // Resolve the second call and validate its prologue.
+        if (g_origIsSpectatorCheck == nullptr && radarPlayersFn != 0) {
+            const auto playerCallsFull = CollectDirectCalls(radarPlayersFn, 0xC00);
+            for (uintptr_t callee : playerCallsFull) {
+                if (!IsInsideModule(client, callee)) {
+                    continue;
+                }
+                const uint8_t* body = reinterpret_cast<const uint8_t*>(callee);
+                const size_t bodySize = ApproxFnSize(callee);
+                for (size_t i = 0; i + 10 < bodySize && i < 0x80; ++i) {
+                    if (body[i] != 0x33 || body[i + 1] != 0xC9) {  // xor ecx,ecx
+                        continue;
+                    }
+                    // First E8 after xor = getEntityBySlot(0); second distinct E8 nearby.
+                    uintptr_t firstCall = 0;
+                    uintptr_t secondCall = 0;
+                    for (size_t j = i; j + 5 < bodySize && j < i + 0x40; ++j) {
+                        uintptr_t target = 0;
+                        if (!DecodeRel32Call(body + j, callee + j, target)) {
+                            continue;
+                        }
+                        if (!IsInsideModule(client, target)) {
+                            continue;
+                        }
+                        if (firstCall == 0) {
+                            firstCall = target;
+                        } else if (target != firstCall) {
+                            secondCall = target;
+                            break;
+                        }
+                        j += 4;
+                    }
+                    if (secondCall != 0 &&
+                        tryAcceptIsSpec(secondCall, "radar-players icon-renderer call chain")) {
+                        break;
+                    }
+                }
+                if (g_origIsSpectatorCheck != nullptr) {
+                    break;
+                }
+            }
+        }
+
         if (g_origIsSpectatorCheck == nullptr) {
             Log("Radar POV: IsSpectatorCheck not found; per-player colours may stay team-based");
         }
