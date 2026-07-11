@@ -1166,10 +1166,8 @@ bool RadarPov_IsInstalled()
 
 void RadarPov_QueueEngineSetup(void (*queueCmd)(const char* cmd))
 {
-    if (queueCmd == nullptr || !g_enabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-    queueCmd("cl_radar_show_all_players_when_spectating 0");
-    queueCmd("cl_radar_square_when_spectating 0");
-    queueCmd("cl_teammate_colors_show 1");
+    // Intentionally empty: do not force radar/teammate-colour cvars.
+    // Upstream identity hooks alone should drive live-POV behaviour; engine
+    // defaults (or the host tool's own command list) own the rest.
+    (void)queueCmd;
 }

@@ -30,4 +30,5 @@ bool RadarPov_Install();
 void RadarPov_Uninstall();
 bool RadarPov_IsInstalled();
 
+// Kept for call-site compatibility; currently queues no engine commands.
 void RadarPov_QueueEngineSetup(void (*queueCmd)(const char* cmd));
