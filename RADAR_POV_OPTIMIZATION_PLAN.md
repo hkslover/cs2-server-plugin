@@ -133,6 +133,15 @@
 - 任一阶段失败都不会留下部分安装状态。
 - 7 个 hook 的目标和 detour 行为不变。
 
+### 本次执行记录
+
+- 实际修改 commit ID：`05b771e`（`perf(radar-pov): batch-enable hooks`）。
+- 代码状态：已完成；7 个 hook 现在先全部 `MH_CreateHook`，再逐个 `MH_QueueEnableHook`，最后只调用一次 `MH_ApplyQueued`。create、queue、apply 均有独立日志；任一阶段失败都复用阶段 2 的精确 target 回滚。
+- A 级检查：`git diff --check` 通过；POSIX 分支 `clang++ -fsyntax-only` 通过（仅有该分支原有的未使用变量警告）；Makefile dry-run 确认 `radar_pov.cpp` 已纳入构建。
+- Windows Release x64 构建：当前 macOS 环境没有 `msbuild`/Windows SDK，留待 B 级里程碑测试时执行。
+- Demo 测试：本阶段不单独启动 Demo，等待阶段 1～3 合并后的 B 级里程碑统一验证。
+- 下一步：阶段 3 已满足代码级验收；阶段 1～3 可进入 B 级验证，之后再进入阶段 4。
+
 ## 阶段 4：整理 Radar update 帧上下文
 
 前置条件：前三阶段稳定。
