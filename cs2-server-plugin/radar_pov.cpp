@@ -173,6 +173,53 @@ bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const c
     return true;
 }
 
+bool ValidateRequiredHookTargets(void* demoStateTarget)
+{
+    size_t resolvedHooks = 0;
+    auto requireHookTarget = [&](const char* name, const void* target) {
+        if (target != nullptr) {
+            ++resolvedHooks;
+            return;
+        }
+        Log("Radar POV: missing required hook target: %s", name);
+    };
+
+    requireHookTarget("radar_update", reinterpret_cast<void*>(g_origRadarUpdate));
+    requireHookTarget("getLocal", reinterpret_cast<void*>(g_origGetLocal));
+    requireHookTarget("radar_demo_state", demoStateTarget);
+    requireHookTarget("getEntityBySlot", reinterpret_cast<void*>(g_origGetEntityBySlot));
+    requireHookTarget("findPlayerBySlot", reinterpret_cast<void*>(g_origFindPlayerBySlot));
+    requireHookTarget("setRadarIconType", reinterpret_cast<void*>(g_origSetRadarIconType));
+    requireHookTarget("radarIconColor", reinterpret_cast<void*>(g_origRadarIconColor));
+
+    if (resolvedHooks != 7) {
+        Log("Radar POV: hook target resolution incomplete: %zu/7 hooks available", resolvedHooks);
+        return false;
+    }
+
+    bool helpersResolved = true;
+    auto requireHelper = [&](const char* name, const void* helper) {
+        if (helper != nullptr) {
+            return;
+        }
+        helpersResolved = false;
+        Log("Radar POV: missing required hook helper: %s", name);
+    };
+
+    requireHelper("getObs", reinterpret_cast<void*>(g_getObserverTarget));
+    requireHelper("getPlayerSlot", reinterpret_cast<void*>(g_getPlayerSlot));
+    requireHelper("GetCompColorArgb", reinterpret_cast<void*>(g_getCompColorArgb));
+    requireHelper("ResolvePlayerByIndex", reinterpret_cast<void*>(g_resolvePlayerByIndex));
+
+    if (!helpersResolved) {
+        Log("Radar POV: required hook helper resolution incomplete; install aborted");
+        return false;
+    }
+
+    Log("Radar POV: resolved 7/7 required hook targets and helpers");
+    return true;
+}
+
 void SetShowAllFlag(void* radar, bool showAll)
 {
     if (radar == nullptr || g_radarShowAllFlagOffset <= 0) {
@@ -1134,6 +1181,20 @@ bool InstallHooks()
         return false;
     }
 
+    void* demoStateTarget = nullptr;
+    __try {
+        void* engineState = *reinterpret_cast<void**>(g_radarDemoStateGlobalSlot);
+        void** vtable = engineState != nullptr ? *reinterpret_cast<void***>(engineState) : nullptr;
+        demoStateTarget = vtable != nullptr ? vtable[0x2B0 / sizeof(void*)] : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        demoStateTarget = nullptr;
+    }
+
+    if (!ValidateRequiredHookTargets(demoStateTarget)) {
+        ResetResolvedRadarState();
+        return false;
+    }
+
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
         Log("Radar POV: MH_Initialize failed: %s (%d)", MhStatusName(st), static_cast<int>(st));
@@ -1145,7 +1206,6 @@ bool InstallHooks()
     void* updateTarget = reinterpret_cast<void*>(g_origRadarUpdate);
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
     void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
-    void* demoStateTarget = nullptr;
 
     if (!CreateAndEnableHook(updateTarget, reinterpret_cast<void*>(&Hook_RadarUpdate),
                              reinterpret_cast<void**>(&g_origRadarUpdate), "radar_update")) {
@@ -1159,13 +1219,6 @@ bool InstallHooks()
         return false;
     }
 
-    __try {
-        void* engineState = *reinterpret_cast<void**>(g_radarDemoStateGlobalSlot);
-        void** vtable = engineState != nullptr ? *reinterpret_cast<void***>(engineState) : nullptr;
-        demoStateTarget = vtable != nullptr ? vtable[0x2B0 / sizeof(void*)] : nullptr;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        demoStateTarget = nullptr;
-    }
     if (!CreateAndEnableHook(demoStateTarget, reinterpret_cast<void*>(&Hook_RadarDemoState),
                              reinterpret_cast<void**>(&g_origRadarDemoState), "radar_demo_state")) {
         AbortInstall();
@@ -1173,62 +1226,62 @@ bool InstallHooks()
     }
 
     // Essential for colours: icon path uses GetEntityBySlot(0), not getLocal.
-    if (g_origGetEntityBySlot != nullptr) {
-        if (CreateAndEnableHook(reinterpret_cast<void*>(g_origGetEntityBySlot),
-                                reinterpret_cast<void*>(&Hook_GetEntityBySlot),
-                                reinterpret_cast<void**>(&g_origGetEntityBySlot),
-                                "getEntityBySlot")) {
-            g_getEntityBySlotHooked = true;
-        } else {
-            Log("Radar POV: GetEntityBySlot hook failed");
-            g_origGetEntityBySlot = nullptr;
-        }
+    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origGetEntityBySlot),
+                             reinterpret_cast<void*>(&Hook_GetEntityBySlot),
+                             reinterpret_cast<void**>(&g_origGetEntityBySlot),
+                             "getEntityBySlot")) {
+        Log("Radar POV: required hook failed: getEntityBySlot");
+        AbortInstall();
+        return false;
     }
+    g_getEntityBySlotHooked = true;
 
-    // Optional: hide freecam spectator from the player list.
-    if (findPlayerBySlotTarget != nullptr && g_getPlayerSlot != nullptr) {
-        if (CreateAndEnableHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
-                                reinterpret_cast<void**>(&g_origFindPlayerBySlot),
-                                "findPlayerBySlot")) {
-            g_spectatorFilterHooked = true;
-        } else {
-            g_origFindPlayerBySlot = reinterpret_cast<FindPlayerBySlotFn>(findPlayerBySlotTarget);
-            Log("Radar POV: spectator-slot filter unavailable");
-        }
+    // Required: hide freecam spectator from the player list.
+    if (!CreateAndEnableHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
+                             reinterpret_cast<void**>(&g_origFindPlayerBySlot),
+                             "findPlayerBySlot")) {
+        Log("Radar POV: required hook failed: findPlayerBySlot");
+        AbortInstall();
+        return false;
     }
+    g_spectatorFilterHooked = true;
 
     // Icon type: live-teammate 0x11 → 9/0xD for native competitive RGB paint.
-    if (g_origSetRadarIconType != nullptr) {
-        if (CreateAndEnableHook(reinterpret_cast<void*>(g_origSetRadarIconType),
-                                reinterpret_cast<void*>(&Hook_SetRadarIconType),
-                                reinterpret_cast<void**>(&g_origSetRadarIconType),
-                                "setRadarIconType")) {
-            g_iconTypeHooked = true;
-        } else {
-            Log("Radar POV: SetRadarIconType hook failed");
-            g_origSetRadarIconType = nullptr;
-        }
+    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origSetRadarIconType),
+                             reinterpret_cast<void*>(&Hook_SetRadarIconType),
+                             reinterpret_cast<void**>(&g_origSetRadarIconType),
+                             "setRadarIconType")) {
+        Log("Radar POV: required hook failed: setRadarIconType");
+        AbortInstall();
+        return false;
     }
+    g_iconTypeHooked = true;
 
     // Force competitive ARGB after native icon colour update (engine palette).
-    if (g_origRadarIconColor != nullptr && g_getCompColorArgb != nullptr) {
-        if (CreateAndEnableHook(reinterpret_cast<void*>(g_origRadarIconColor),
-                                reinterpret_cast<void*>(&Hook_RadarIconColor),
-                                reinterpret_cast<void**>(&g_origRadarIconColor),
-                                "radarIconColor")) {
-            g_iconColorHooked = true;
-        } else {
-            Log("Radar POV: RadarIconColor hook failed");
-        }
-    } else {
-        Log("Radar POV: force-color unavailable (iconColor=%p argb=%p resolve=%p)",
-            reinterpret_cast<void*>(g_origRadarIconColor),
-            reinterpret_cast<void*>(g_getCompColorArgb),
-            reinterpret_cast<void*>(g_resolvePlayerByIndex));
+    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origRadarIconColor),
+                             reinterpret_cast<void*>(&Hook_RadarIconColor),
+                             reinterpret_cast<void**>(&g_origRadarIconColor),
+                             "radarIconColor")) {
+        Log("Radar POV: required hook failed: radarIconColor");
+        AbortInstall();
+        return false;
+    }
+    g_iconColorHooked = true;
+
+    const int activeHooks =
+        (g_origRadarUpdate != nullptr ? 1 : 0) + (g_origGetLocal != nullptr ? 1 : 0) +
+        (g_origRadarDemoState != nullptr ? 1 : 0) + (g_getEntityBySlotHooked ? 1 : 0) +
+        (g_spectatorFilterHooked ? 1 : 0) + (g_iconTypeHooked ? 1 : 0) +
+        (g_iconColorHooked ? 1 : 0);
+    if (activeHooks != 7) {
+        Log("Radar POV: hook activation incomplete: %d/7 hooks active; install aborted",
+            activeHooks);
+        AbortInstall();
+        return false;
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed enabled=%d update=%d getLocal=%d getObs=%d demoState=%d "
+    Log("Radar POV: installed 7/7 hooks active enabled=%d update=%d getLocal=%d getObs=%d demoState=%d "
         "getEntityBySlot=%d spectatorFilter=%d iconType=%d forceColor=%d",
         g_enabled.load() ? 1 : 0, g_origRadarUpdate != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0, g_getObserverTarget != nullptr ? 1 : 0,
