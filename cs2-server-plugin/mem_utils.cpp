@@ -14,6 +14,26 @@
 namespace MemUtils {
 namespace {
 
+void GetCodeRange(const ModuleInfo& mod, const uint8_t*& begin, size_t& size)
+{
+    if (mod.textBase != nullptr && mod.textSize != 0) {
+        begin = mod.textBase;
+        size = mod.textSize;
+        return;
+    }
+    begin = mod.base;
+    size = mod.size;
+}
+
+bool IsInRange(const uint8_t* begin, size_t size, uintptr_t addr)
+{
+    if (begin == nullptr || size == 0) {
+        return false;
+    }
+    const uintptr_t first = reinterpret_cast<uintptr_t>(begin);
+    return addr >= first && addr - first < size;
+}
+
 struct PatternByte {
     uint8_t value = 0;
     uint8_t mask = 0;
@@ -116,6 +136,7 @@ bool MatchPatternAt(const uint8_t* p, const std::vector<PatternByte>& pat)
 
 bool GetModuleInfo(const char* name, ModuleInfo& out)
 {
+    out = {};
 #ifdef _WIN32
     HMODULE mod = GetModuleHandleA(name);
     if (mod == nullptr) {
@@ -127,10 +148,73 @@ bool GetModuleInfo(const char* name, ModuleInfo& out)
     }
     out.base = reinterpret_cast<uint8_t*>(info.lpBaseOfDll);
     out.size = static_cast<size_t>(info.SizeOfImage);
-    return out.base != nullptr && out.size > 0;
+    if (out.base == nullptr || out.size == 0) {
+        out = {};
+        return false;
+    }
+
+    if (out.size < sizeof(IMAGE_DOS_HEADER)) {
+        return true;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(out.base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > out.size) {
+        return true;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(out.base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+        return true;
+    }
+
+    const size_t sectionTableOffset = static_cast<size_t>(dos->e_lfanew) +
+        sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader;
+    if (sectionTableOffset > out.size ||
+        nt->FileHeader.NumberOfSections >
+            (out.size - sectionTableOffset) / sizeof(IMAGE_SECTION_HEADER)) {
+        return true;
+    }
+
+    const IMAGE_SECTION_HEADER* executableFallback = nullptr;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt) + i;
+        const size_t sectionOffset = static_cast<size_t>(section->VirtualAddress);
+        size_t sectionSize = section->Misc.VirtualSize;
+        if (sectionSize < section->SizeOfRawData) {
+            sectionSize = section->SizeOfRawData;
+        }
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 ||
+            sectionSize == 0 || sectionOffset >= out.size) {
+            continue;
+        }
+        sectionSize = sectionSize < out.size - sectionOffset ? sectionSize
+                                                              : out.size - sectionOffset;
+        if (sectionSize == 0) {
+            continue;
+        }
+        if (executableFallback == nullptr) {
+            executableFallback = section;
+        }
+        if (memcmp(section->Name, ".text", 5) == 0) {
+            out.textBase = out.base + sectionOffset;
+            out.textSize = sectionSize;
+            break;
+        }
+    }
+    if (out.textBase == nullptr && executableFallback != nullptr) {
+        const size_t sectionOffset = static_cast<size_t>(executableFallback->VirtualAddress);
+        size_t sectionSize = executableFallback->Misc.VirtualSize;
+        if (sectionSize < executableFallback->SizeOfRawData) {
+            sectionSize = executableFallback->SizeOfRawData;
+        }
+        out.textBase = out.base + sectionOffset;
+        out.textSize = sectionSize < out.size - sectionOffset ? sectionSize
+                                                              : out.size - sectionOffset;
+    }
+    return true;
 #else
     (void)name;
-    (void)out;
     return false;
 #endif
 }
@@ -159,8 +243,35 @@ uint32_t GetPeTimestamp(const ModuleInfo& mod)
 
 bool IsInsideModule(const ModuleInfo& mod, uintptr_t addr)
 {
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
-    return mod.base != nullptr && addr >= base && addr < base + mod.size;
+    return IsInRange(mod.base, mod.size, addr);
+}
+
+bool IsInsideText(const ModuleInfo& mod, uintptr_t addr)
+{
+    const uint8_t* begin = nullptr;
+    size_t size = 0;
+    GetCodeRange(mod, begin, size);
+    return IsInRange(begin, size, addr);
+}
+
+bool IsExecutableAddress(uintptr_t addr)
+{
+#ifdef _WIN32
+    if (addr == 0) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != sizeof(info) ||
+        info.State != MEM_COMMIT) {
+        return false;
+    }
+    const DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+        PAGE_EXECUTE_WRITECOPY;
+    return (info.Protect & executable) != 0;
+#else
+    (void)addr;
+    return false;
+#endif
 }
 
 bool IsLikelyDataObject(const ModuleInfo& mod, uintptr_t addr)
@@ -170,7 +281,10 @@ bool IsLikelyDataObject(const ModuleInfo& mod, uintptr_t addr)
     }
     const auto* s = reinterpret_cast<const char*>(addr);
     int printable = 0;
-    for (int i = 0; i < 16; ++i) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
+    const size_t available = mod.size - (addr - base);
+    const size_t limit = available < 16 ? available : 16;
+    for (size_t i = 0; i < limit; ++i) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
         if (c == 0) {
             break;
@@ -282,14 +396,17 @@ bool DecodeRel32Call(const uint8_t* insn, uintptr_t insnAddr, uintptr_t& targetO
 std::vector<uintptr_t> FindLeaRipXrefs(const ModuleInfo& mod, uintptr_t target)
 {
     std::vector<uintptr_t> hits;
-    if (mod.base == nullptr || mod.size < 7) {
+    const uint8_t* codeBase = nullptr;
+    size_t codeSize = 0;
+    GetCodeRange(mod, codeBase, codeSize);
+    if (codeBase == nullptr || codeSize < 7) {
         return hits;
     }
-    for (size_t i = 0; i + 7 <= mod.size; ++i) {
+    for (size_t i = 0; i + 7 <= codeSize; ++i) {
         uintptr_t resolved = 0;
         size_t sz = 0;
-        const uintptr_t addr = reinterpret_cast<uintptr_t>(mod.base + i);
-        if (DecodeLeaRip(mod.base + i, addr, resolved, sz) && resolved == target) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(codeBase + i);
+        if (DecodeLeaRip(codeBase + i, addr, resolved, sz) && resolved == target) {
             hits.push_back(addr);
         }
     }
@@ -299,16 +416,19 @@ std::vector<uintptr_t> FindLeaRipXrefs(const ModuleInfo& mod, uintptr_t target)
 std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
 {
     std::vector<uintptr_t> sites;
-    if (mod.base == nullptr || fn == 0) {
+    const uint8_t* codeBase = nullptr;
+    size_t codeSize = 0;
+    GetCodeRange(mod, codeBase, codeSize);
+    if (codeBase == nullptr || fn == 0) {
         return sites;
     }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
-    for (size_t i = 0; i + 5 < mod.size; ++i) {
-        if (mod.base[i] != 0xE8) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(codeBase);
+    for (size_t i = 0; i + 5 <= codeSize; ++i) {
+        if (codeBase[i] != 0xE8) {
             continue;
         }
         uintptr_t target = 0;
-        if (!DecodeRel32Call(mod.base + i, base + i, target)) {
+        if (!DecodeRel32Call(codeBase + i, base + i, target)) {
             continue;
         }
         if (target == fn) {
@@ -318,20 +438,28 @@ std::vector<uintptr_t> FindE8CallSites(const ModuleInfo& mod, uintptr_t fn)
     return sites;
 }
 
-std::vector<uintptr_t> CollectDirectCalls(uintptr_t fn, size_t maxScan)
+std::vector<uintptr_t> CollectDirectCalls(const ModuleInfo& mod, uintptr_t fn, size_t maxScan)
 {
     std::vector<uintptr_t> calls;
-    if (fn == 0) {
+    const uint8_t* codeBase = nullptr;
+    size_t codeSize = 0;
+    GetCodeRange(mod, codeBase, codeSize);
+    if (codeBase == nullptr || fn == 0 || !IsInRange(codeBase, codeSize, fn)) {
         return calls;
     }
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-    for (size_t i = 0; i + 5 < maxScan; ++i) {
-        if (p[i] == 0xCC && p[i + 1] == 0xCC && i > 0x40) {
+    const size_t fnOffset = static_cast<size_t>(fn - reinterpret_cast<uintptr_t>(codeBase));
+    const size_t available = codeSize - fnOffset;
+    const size_t scanSize = maxScan < available ? maxScan : available;
+    for (size_t i = 0; i + 5 <= scanSize; ++i) {
+        if (i + 1 < scanSize && p[i] == 0xCC && p[i + 1] == 0xCC && i > 0x40) {
             break;
         }
         uintptr_t target = 0;
         if (DecodeRel32Call(p + i, fn + i, target)) {
-            calls.push_back(target);
+            if (IsInRange(codeBase, codeSize, target)) {
+                calls.push_back(target);
+            }
             i += 4;
         }
     }
@@ -369,30 +497,44 @@ bool LooksLikePrologue(const uint8_t* p)
 
 uintptr_t FindFunctionStart(const ModuleInfo& mod, uintptr_t anywhereInFn)
 {
-    if (mod.base == nullptr || anywhereInFn < reinterpret_cast<uintptr_t>(mod.base)) {
+    const uint8_t* codeBase = nullptr;
+    size_t codeSize = 0;
+    GetCodeRange(mod, codeBase, codeSize);
+    if (codeBase == nullptr || !IsInRange(codeBase, codeSize, anywhereInFn)) {
         return 0;
     }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(mod.base);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(codeBase);
+    const uintptr_t end = base + codeSize;
     const uintptr_t minAddr = anywhereInFn > base + 0x2000 ? anywhereInFn - 0x2000 : base;
     for (uintptr_t p = anywhereInFn; p > minAddr; --p) {
         const uint8_t prev = *reinterpret_cast<const uint8_t*>(p - 1);
         if ((prev == 0xCC || prev == 0x90 || prev == 0xC3 || prev == 0xC2) &&
-            LooksLikePrologue(reinterpret_cast<const uint8_t*>(p))) {
+            p + 3 < end && LooksLikePrologue(reinterpret_cast<const uint8_t*>(p))) {
             return p;
         }
     }
-    return anywhereInFn & ~static_cast<uintptr_t>(0xF);
+    const uintptr_t aligned = anywhereInFn & ~static_cast<uintptr_t>(0xF);
+    return aligned >= base && aligned < end ? aligned : 0;
 }
 
-size_t ApproxFnSize(uintptr_t fn)
+size_t ApproxFnSize(const ModuleInfo& mod, uintptr_t fn)
 {
+    const uint8_t* codeBase = nullptr;
+    size_t codeSize = 0;
+    GetCodeRange(mod, codeBase, codeSize);
+    if (codeBase == nullptr || !IsInRange(codeBase, codeSize, fn)) {
+        return 0;
+    }
+    const size_t fnOffset = static_cast<size_t>(fn - reinterpret_cast<uintptr_t>(codeBase));
+    const size_t available = codeSize - fnOffset;
+    const size_t scanSize = available < 0x2000 ? available : 0x2000;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
-    for (size_t i = 0x20; i < 0x2000; ++i) {
+    for (size_t i = 0x20; i + 1 < scanSize; ++i) {
         if (p[i] == 0xCC && p[i + 1] == 0xCC) {
             return i;
         }
     }
-    return 0x100;
+    return scanSize < 0x100 ? scanSize : 0x100;
 }
 
 }  // namespace MemUtils
