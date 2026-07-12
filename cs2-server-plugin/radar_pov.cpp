@@ -231,7 +231,7 @@ void ReleaseMinHook()
     g_minhookOwned = false;
 }
 
-bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const char* name)
+bool CreateHook(void* target, void* detour, void** originalOut, const char* name)
 {
     if (target == nullptr || detour == nullptr || originalOut == nullptr) {
         return false;
@@ -245,15 +245,33 @@ bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const c
 
     g_createdRadarHooks.push_back({target, name});
 
-    st = MH_EnableHook(target);
+    Log("Radar POV: created hook %s @ %p (trampoline %p)", name, target, *originalOut);
+    return true;
+}
+
+bool QueueHookEnable(const CreatedRadarHook& hook)
+{
+    const MH_STATUS st = MH_QueueEnableHook(hook.target);
     if (st != MH_OK) {
-        Log("Radar POV: MH_EnableHook(%s) @ %p failed: %s (%d)", name, target, MhStatusName(st),
-            static_cast<int>(st));
-        RemoveCreatedHooks();
-        *originalOut = nullptr;
+        Log("Radar POV: MH_QueueEnableHook(%s) @ %p failed: %s (%d)", hook.name, hook.target,
+            MhStatusName(st), static_cast<int>(st));
         return false;
     }
-    Log("Radar POV: MinHook enabled %s @ %p (trampoline %p)", name, target, *originalOut);
+
+    Log("Radar POV: queued hook %s @ %p for enable", hook.name, hook.target);
+    return true;
+}
+
+bool ApplyQueuedHookEnables()
+{
+    const MH_STATUS st = MH_ApplyQueued();
+    if (st != MH_OK) {
+        Log("Radar POV: MH_ApplyQueued failed: %s (%d)", MhStatusName(st),
+            static_cast<int>(st));
+        return false;
+    }
+
+    Log("Radar POV: applied queued hook enables (%zu/7 hooks)", g_createdRadarHooks.size());
     return true;
 }
 
@@ -1303,67 +1321,80 @@ bool InstallHooks()
 
     void* updateTarget = reinterpret_cast<void*>(g_origRadarUpdate);
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
+    void* demoStateTargetForHook = demoStateTarget;
+    void* getEntityBySlotTarget = reinterpret_cast<void*>(g_origGetEntityBySlot);
     void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
+    void* setRadarIconTypeTarget = reinterpret_cast<void*>(g_origSetRadarIconType);
+    void* radarIconColorTarget = reinterpret_cast<void*>(g_origRadarIconColor);
 
-    if (!CreateAndEnableHook(updateTarget, reinterpret_cast<void*>(&Hook_RadarUpdate),
-                             reinterpret_cast<void**>(&g_origRadarUpdate), "radar_update")) {
+    // Stage 3: create all hooks before changing any target's executable bytes.
+    if (!CreateHook(updateTarget, reinterpret_cast<void*>(&Hook_RadarUpdate),
+                    reinterpret_cast<void**>(&g_origRadarUpdate), "radar_update")) {
         AbortInstall();
         return false;
     }
 
-    if (!CreateAndEnableHook(getLocalTarget, reinterpret_cast<void*>(&Hook_GetLocal),
-                             reinterpret_cast<void**>(&g_origGetLocal), "getLocal")) {
+    if (!CreateHook(getLocalTarget, reinterpret_cast<void*>(&Hook_GetLocal),
+                    reinterpret_cast<void**>(&g_origGetLocal), "getLocal")) {
         AbortInstall();
         return false;
     }
 
-    if (!CreateAndEnableHook(demoStateTarget, reinterpret_cast<void*>(&Hook_RadarDemoState),
-                             reinterpret_cast<void**>(&g_origRadarDemoState), "radar_demo_state")) {
+    if (!CreateHook(demoStateTargetForHook, reinterpret_cast<void*>(&Hook_RadarDemoState),
+                    reinterpret_cast<void**>(&g_origRadarDemoState), "radar_demo_state")) {
         AbortInstall();
         return false;
     }
 
     // Essential for colours: icon path uses GetEntityBySlot(0), not getLocal.
-    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origGetEntityBySlot),
-                             reinterpret_cast<void*>(&Hook_GetEntityBySlot),
-                             reinterpret_cast<void**>(&g_origGetEntityBySlot),
-                             "getEntityBySlot")) {
+    if (!CreateHook(getEntityBySlotTarget, reinterpret_cast<void*>(&Hook_GetEntityBySlot),
+                    reinterpret_cast<void**>(&g_origGetEntityBySlot), "getEntityBySlot")) {
         Log("Radar POV: required hook failed: getEntityBySlot");
         AbortInstall();
         return false;
     }
-    g_getEntityBySlotHooked = true;
 
     // Required: hide freecam spectator from the player list.
-    if (!CreateAndEnableHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
-                             reinterpret_cast<void**>(&g_origFindPlayerBySlot),
-                             "findPlayerBySlot")) {
+    if (!CreateHook(findPlayerBySlotTarget, reinterpret_cast<void*>(&Hook_FindPlayerBySlot),
+                    reinterpret_cast<void**>(&g_origFindPlayerBySlot), "findPlayerBySlot")) {
         Log("Radar POV: required hook failed: findPlayerBySlot");
         AbortInstall();
         return false;
     }
-    g_spectatorFilterHooked = true;
 
     // Icon type: live-teammate 0x11 → 9/0xD for native competitive RGB paint.
-    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origSetRadarIconType),
-                             reinterpret_cast<void*>(&Hook_SetRadarIconType),
-                             reinterpret_cast<void**>(&g_origSetRadarIconType),
-                             "setRadarIconType")) {
+    if (!CreateHook(setRadarIconTypeTarget, reinterpret_cast<void*>(&Hook_SetRadarIconType),
+                    reinterpret_cast<void**>(&g_origSetRadarIconType), "setRadarIconType")) {
         Log("Radar POV: required hook failed: setRadarIconType");
         AbortInstall();
         return false;
     }
-    g_iconTypeHooked = true;
 
     // Force competitive ARGB after native icon colour update (engine palette).
-    if (!CreateAndEnableHook(reinterpret_cast<void*>(g_origRadarIconColor),
-                             reinterpret_cast<void*>(&Hook_RadarIconColor),
-                             reinterpret_cast<void**>(&g_origRadarIconColor),
-                             "radarIconColor")) {
+    if (!CreateHook(radarIconColorTarget, reinterpret_cast<void*>(&Hook_RadarIconColor),
+                    reinterpret_cast<void**>(&g_origRadarIconColor), "radarIconColor")) {
         Log("Radar POV: required hook failed: radarIconColor");
         AbortInstall();
         return false;
     }
+
+    // Queue all enables only after every hook has been created. This keeps the
+    // target set inactive until one final MH_ApplyQueued call below.
+    for (const CreatedRadarHook& hook : g_createdRadarHooks) {
+        if (!QueueHookEnable(hook)) {
+            AbortInstall();
+            return false;
+        }
+    }
+
+    if (!ApplyQueuedHookEnables()) {
+        AbortInstall();
+        return false;
+    }
+
+    g_getEntityBySlotHooked = true;
+    g_spectatorFilterHooked = true;
+    g_iconTypeHooked = true;
     g_iconColorHooked = true;
 
     const int activeHooks =
