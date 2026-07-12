@@ -39,8 +39,12 @@ RadarPovLogFn g_log = nullptr;
 std::atomic<bool> g_enabled{false};
 std::atomic<bool> g_installed{false};
 
+#ifdef _WIN32
 struct RadarPovFrameContext {
     int depth = 0;
+    // Snapshot the feature switch once at the outermost radar update. Inner
+    // detours stay on TLS and do not repeatedly touch the atomic setting.
+    bool enabled = false;
     void* selfPawn = nullptr;
     bool active = false;
     int spectatorSlot = -1;
@@ -50,6 +54,12 @@ struct RadarPovFrameContext {
 };
 
 thread_local RadarPovFrameContext g_povFrame;
+
+inline bool IsPovFrameActive()
+{
+    return g_povFrame.enabled && g_povFrame.depth > 0 && g_povFrame.active;
+}
+#endif
 
 std::atomic<int> g_faultRadarUpdate{0};
 std::atomic<int> g_faultGetLocal{0};
@@ -452,8 +462,7 @@ void* __fastcall Hook_GetLocal()
         return nullptr;
     }
 
-    if (!g_enabled.load(std::memory_order_relaxed) || g_povFrame.depth <= 0 ||
-        !g_povFrame.active) {
+    if (!IsPovFrameActive()) {
         return real;
     }
     return g_povFrame.selfPawn != nullptr ? g_povFrame.selfPawn : real;
@@ -466,8 +475,7 @@ void* __fastcall Hook_GetEntityBySlot(int slot)
     if (g_origGetEntityBySlot == nullptr) {
         return nullptr;
     }
-    if (g_enabled.load(std::memory_order_relaxed) && g_povFrame.depth > 0 &&
-        g_povFrame.active && g_povFrame.selfSlot >= 0 && (slot == 0 || slot == -1)) {
+    if (IsPovFrameActive() && g_povFrame.selfSlot >= 0 && (slot == 0 || slot == -1)) {
         const int n = g_logGetEntityBySlot.fetch_add(1);
         if (n == 0) {
             Log("Radar POV: GetEntityBySlot %d -> observed slot %d", slot,
@@ -583,6 +591,7 @@ void PreparePovContext()
 
 void ClearPovContext()
 {
+    g_povFrame.enabled = false;
     g_povFrame.selfPawn = nullptr;
     g_povFrame.active = false;
     g_povFrame.spectatorSlot = -1;
@@ -605,6 +614,7 @@ public:
         const bool outermost = g_povFrame.depth == 0;
         ++g_povFrame.depth;
         if (outermost) {
+            g_povFrame.enabled = true;
             PreparePovContext();
             SetShowAllFlag(radar_, !g_povFrame.active);
         }
@@ -649,7 +659,12 @@ void CallOriginalRadarUpdate(void* updateContext, uint8_t updateEnabled)
 
 void __fastcall Hook_RadarUpdate(void* updateContext, uint8_t updateEnabled)
 {
-    RadarPovFrameScope frame(g_enabled.load(std::memory_order_relaxed), updateContext);
+    // Nested updates inherit the outer frame snapshot. Only the outermost
+    // update needs to read the atomic feature switch.
+    const bool enabled = g_povFrame.depth > 0
+        ? g_povFrame.enabled
+        : g_enabled.load(std::memory_order_relaxed);
+    RadarPovFrameScope frame(enabled, updateContext);
     CallOriginalRadarUpdate(updateContext, updateEnabled);
 }
 
@@ -659,7 +674,7 @@ uint8_t __fastcall Hook_RadarDemoState(void* engineState)
     if (g_origRadarDemoState != nullptr) {
         result = g_origRadarDemoState(engineState);
     }
-    if (g_povFrame.depth > 0 && g_povFrame.active) {
+    if (IsPovFrameActive()) {
         if (g_logDemoStateOverride.fetch_add(1) == 0) {
             Log("Radar POV: demo/HLTV state %u -> 0 for radar frame",
                 static_cast<unsigned>(result));
@@ -671,8 +686,7 @@ uint8_t __fastcall Hook_RadarDemoState(void* engineState)
 
 void* __fastcall Hook_FindPlayerBySlot(int slot)
 {
-    if (g_enabled.load(std::memory_order_relaxed) && g_povFrame.depth > 0 &&
-        g_povFrame.active && g_povFrame.spectatorSlot >= 0 &&
+    if (IsPovFrameActive() && g_povFrame.spectatorSlot >= 0 &&
         slot == g_povFrame.spectatorSlot) {
         if (g_logSpectatorFilter.fetch_add(1) == 0) {
             Log("Radar POV: filtering demo spectator slot %d", g_povFrame.spectatorSlot);
@@ -690,8 +704,7 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
     if (g_origSetRadarIconType != nullptr) {
         g_origSetRadarIconType(icon, playerTeam);
     }
-    if (!g_enabled.load(std::memory_order_relaxed) || g_povFrame.depth <= 0 ||
-        !g_povFrame.active || icon == nullptr || !IsPovTeammateTeam(playerTeam)) {
+    if (!IsPovFrameActive() || icon == nullptr || !IsPovTeammateTeam(playerTeam)) {
         return;
     }
     __try {
@@ -758,7 +771,7 @@ bool SetIconPanelColor(void* icon, ptrdiff_t panelOff, uint32_t* argb)
 // Demo netvars / gates often leave native paint as a no-op even when types are fixed.
 void ForceCompetitiveIconColor(void* icon)
 {
-    if (icon == nullptr || g_getCompColorArgb == nullptr || !g_povFrame.active) {
+    if (icon == nullptr || g_getCompColorArgb == nullptr || !IsPovFrameActive()) {
         return;
     }
     __try {
@@ -845,8 +858,7 @@ void ForceCompetitiveIconColor(void* icon)
 
 void __fastcall Hook_RadarIconColor(void* radar, void* icon)
 {
-    if (g_enabled.load(std::memory_order_relaxed) && g_povFrame.depth > 0 &&
-        g_povFrame.active && icon != nullptr) {
+    if (IsPovFrameActive() && icon != nullptr) {
         __try {
             // Defeat per-icon rate-limit in the live colour branch.
             *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(icon) + kIconColorTimeOffset) =
@@ -860,8 +872,7 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
         g_origRadarIconColor(radar, icon);
     }
 
-    if (g_enabled.load(std::memory_order_relaxed) && g_povFrame.depth > 0 &&
-        g_povFrame.active) {
+    if (IsPovFrameActive()) {
         ForceCompetitiveIconColor(icon);
     }
 }
