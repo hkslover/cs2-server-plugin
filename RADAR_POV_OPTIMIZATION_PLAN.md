@@ -161,8 +161,17 @@
 ### 验收条件
 
 - 普通调用和人工构造的嵌套调用均能正确恢复 context。
-- `g_povActive` 不会在外层 radar update 尚未结束时被内层提前清空。
+- `RadarPovFrameContext::active` 不会在外层 radar update 尚未结束时被内层提前清空。
 - 在本阶段触发的 C 级测试中确认 Demo 行为不变。
+
+### 本次执行记录
+
+- 实际修改 commit ID：`0ab9319`（`refactor(radar-pov): scope frame context with RAII`）。
+- 代码状态：已完成；TLS 状态已收拢为 `RadarPovFrameContext`，仅在深度 `0 -> 1` 准备、在 `1 -> 0` 清理，使用 `RadarPovFrameScope` 成对管理；原始 update 的 SEH 捕获已移到独立 helper，避免与 RAII 析构路径冲突，并增加 `updateContext == nullptr` 防护。
+- A 级检查：`git diff --check` 通过；POSIX 分支 `clang++ -fsyntax-only` 通过（仅有非 Windows 分支下的未使用变量类警告）；Makefile dry-run 确认 `radar_pov.cpp` 仍纳入构建。
+- Windows Release x64 构建：当前 macOS 环境没有 `msbuild`/Windows SDK，留待 C 级里程碑执行。
+- Demo 测试：本阶段需要 C 级完整功能回归；当前未执行，等待 Windows 环境验证嵌套/异常清理和 POV 雷达行为。
+- 下一步：阶段 4 代码完成，待 C 级验证通过后进入阶段 5。
 
 ## 阶段 5：加强 resolver 的唯一性和边界检查
 
