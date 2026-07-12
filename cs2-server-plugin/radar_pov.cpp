@@ -104,11 +104,19 @@ GetCompColorArgbFn g_getCompColorArgb = nullptr;
 ResolvePlayerByIndexFn g_resolvePlayerByIndex = nullptr;
 
 bool g_minhookInitialized = false;
+bool g_minhookOwned = false;
 bool g_spectatorFilterHooked = false;
 bool g_getEntityBySlotHooked = false;
 bool g_iconTypeHooked = false;
 bool g_iconColorHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
+
+struct CreatedRadarHook {
+    void* target = nullptr;
+    const char* name = nullptr;
+};
+
+std::vector<CreatedRadarHook> g_createdRadarHooks;
 
 constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
 constexpr size_t kIsObserverVtableByteOff = 0xAA0;
@@ -150,6 +158,79 @@ const char* MhStatusName(MH_STATUS st)
     }
 }
 
+bool RemoveCreatedHook(const CreatedRadarHook& hook)
+{
+    bool removed = true;
+
+    const MH_STATUS disableStatus = MH_DisableHook(hook.target);
+    if (disableStatus != MH_OK && disableStatus != MH_ERROR_DISABLED &&
+        disableStatus != MH_ERROR_NOT_CREATED) {
+        Log("Radar POV: MH_DisableHook(%s) @ %p failed: %s (%d)", hook.name, hook.target,
+            MhStatusName(disableStatus), static_cast<int>(disableStatus));
+        removed = false;
+    }
+
+    const MH_STATUS removeStatus = MH_RemoveHook(hook.target);
+    if (removeStatus != MH_OK && removeStatus != MH_ERROR_NOT_CREATED) {
+        Log("Radar POV: MH_RemoveHook(%s) @ %p failed: %s (%d)", hook.name, hook.target,
+            MhStatusName(removeStatus), static_cast<int>(removeStatus));
+        removed = false;
+    }
+
+    if (removed) {
+        Log("Radar POV: removed hook %s @ %p", hook.name, hook.target);
+    }
+    return removed;
+}
+
+bool RemoveCreatedHooks()
+{
+    if (g_createdRadarHooks.empty()) {
+        return true;
+    }
+
+    std::vector<CreatedRadarHook> remaining;
+    remaining.reserve(g_createdRadarHooks.size());
+    for (auto it = g_createdRadarHooks.rbegin(); it != g_createdRadarHooks.rend(); ++it) {
+        if (!RemoveCreatedHook(*it)) {
+            remaining.push_back(*it);
+        }
+    }
+
+    g_createdRadarHooks.assign(remaining.rbegin(), remaining.rend());
+    if (!g_createdRadarHooks.empty()) {
+        Log("Radar POV: precise hook cleanup incomplete: %zu target(s) remain",
+            g_createdRadarHooks.size());
+        return false;
+    }
+    return true;
+}
+
+void ReleaseMinHook()
+{
+    if (!g_minhookInitialized) {
+        return;
+    }
+
+    if (!g_minhookOwned) {
+        Log("Radar POV: leaving shared MinHook lifecycle initialized by another module");
+        g_minhookInitialized = false;
+        g_minhookOwned = false;
+        return;
+    }
+
+    const MH_STATUS st = MH_Uninitialize();
+    if (st != MH_OK && st != MH_ERROR_NOT_INITIALIZED) {
+        Log("Radar POV: MH_Uninitialize failed: %s (%d)", MhStatusName(st),
+            static_cast<int>(st));
+        return;
+    }
+
+    Log("Radar POV: released MinHook lifecycle owned by Radar POV");
+    g_minhookInitialized = false;
+    g_minhookOwned = false;
+}
+
 bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const char* name)
 {
     if (target == nullptr || detour == nullptr || originalOut == nullptr) {
@@ -161,11 +242,14 @@ bool CreateAndEnableHook(void* target, void* detour, void** originalOut, const c
             static_cast<int>(st));
         return false;
     }
+
+    g_createdRadarHooks.push_back({target, name});
+
     st = MH_EnableHook(target);
     if (st != MH_OK) {
         Log("Radar POV: MH_EnableHook(%s) @ %p failed: %s (%d)", name, target, MhStatusName(st),
             static_cast<int>(st));
-        MH_RemoveHook(target);
+        RemoveCreatedHooks();
         *originalOut = nullptr;
         return false;
     }
@@ -1151,24 +1235,30 @@ void ResetResolvedRadarState()
     g_installed.store(false, std::memory_order_release);
 }
 
-void DisableInstalledHooks()
-{
-    if (!g_minhookInitialized) {
-        return;
-    }
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
-    g_minhookInitialized = false;
-}
-
 void AbortInstall()
 {
-    DisableInstalledHooks();
+    const bool hooksRemoved = RemoveCreatedHooks();
+    if (hooksRemoved) {
+        ReleaseMinHook();
+    } else {
+        Log("Radar POV: install rollback left %zu target(s) tracked for retry",
+            g_createdRadarHooks.size());
+    }
     ResetResolvedRadarState();
 }
 
 bool InstallHooks()
 {
+    if (!g_createdRadarHooks.empty()) {
+        Log("Radar POV: cleaning up %zu target(s) left by a previous failed install",
+            g_createdRadarHooks.size());
+        if (!RemoveCreatedHooks()) {
+            Log("Radar POV: previous install cleanup still incomplete; refusing reinstall");
+            return false;
+        }
+        ReleaseMinHook();
+    }
+
     ModuleInfo client = {};
     if (!GetModuleInfo("client.dll", client)) {
         Log("Radar POV: client.dll not loaded yet");
@@ -1195,13 +1285,21 @@ bool InstallHooks()
         return false;
     }
 
-    MH_STATUS st = MH_Initialize();
-    if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
-        Log("Radar POV: MH_Initialize failed: %s (%d)", MhStatusName(st), static_cast<int>(st));
-        ResetResolvedRadarState();
-        return false;
+    if (!g_minhookInitialized) {
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+            Log("Radar POV: MH_Initialize failed: %s (%d)", MhStatusName(st),
+                static_cast<int>(st));
+            ResetResolvedRadarState();
+            return false;
+        }
+        g_minhookInitialized = true;
+        g_minhookOwned = st == MH_OK;
+        Log("Radar POV: MinHook lifecycle ready owned=%d (%s)", g_minhookOwned ? 1 : 0,
+            MhStatusName(st));
+    } else {
+        Log("Radar POV: reusing MinHook lifecycle owned=%d", g_minhookOwned ? 1 : 0);
     }
-    g_minhookInitialized = true;
 
     void* updateTarget = reinterpret_cast<void*>(g_origRadarUpdate);
     void* getLocalTarget = reinterpret_cast<void*>(g_origGetLocal);
@@ -1273,9 +1371,10 @@ bool InstallHooks()
         (g_origRadarDemoState != nullptr ? 1 : 0) + (g_getEntityBySlotHooked ? 1 : 0) +
         (g_spectatorFilterHooked ? 1 : 0) + (g_iconTypeHooked ? 1 : 0) +
         (g_iconColorHooked ? 1 : 0);
-    if (activeHooks != 7) {
-        Log("Radar POV: hook activation incomplete: %d/7 hooks active; install aborted",
-            activeHooks);
+    if (activeHooks != 7 || g_createdRadarHooks.size() != 7) {
+        Log("Radar POV: hook activation incomplete: %d/7 hooks active, %zu/7 targets tracked; "
+            "install aborted",
+            activeHooks, g_createdRadarHooks.size());
         AbortInstall();
         return false;
     }
@@ -1292,9 +1391,14 @@ bool InstallHooks()
 
 void UninstallHooks()
 {
-    DisableInstalledHooks();
+    if (!RemoveCreatedHooks()) {
+        Log("Radar POV: uninstall incomplete; %zu target(s) remain tracked",
+            g_createdRadarHooks.size());
+        return;
+    }
+    ReleaseMinHook();
     ResetResolvedRadarState();
-    Log("Radar POV: MinHook hooks removed");
+    Log("Radar POV: MinHook hooks removed precisely");
 }
 
 #else // !_WIN32
