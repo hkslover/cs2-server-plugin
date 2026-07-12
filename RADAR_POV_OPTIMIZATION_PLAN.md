@@ -219,6 +219,15 @@
 
 不建议在没有 profiling 证据时提前缓存 Panorama panel/style 指针，这些对象可能重建。
 
+### 本次执行记录
+
+- 实际修改 commit ID：`07b06517c2127ac631d862b626b884c309a7defb`（`perf(radar-pov): snapshot frame enable state`）。
+- 代码状态：已完成阶段 6 的第一项低风险优化；最外层 `radar_update` 只读取一次 `g_enabled` 并写入 `RadarPovFrameContext::enabled`，嵌套 update 和其余 detour 通过 `IsPovFrameActive()` 读取 TLS 快照。帧内开关状态保持一致，7 个 hook、调用顺序、resolver 和颜色逻辑未改变。
+- 静态热路径复核：原有内部 hook 的 6 处 `g_enabled.load` 已收敛为最外层读取 1 次；当前没有提交的 Windows Demo profiling/帧耗时数据，因此暂不执行 controller/team/ARGB 或诊断原子计数缓存，也不缓存 Panorama panel/style 指针。
+- A 级检查：`git diff --check` 通过；POSIX 分支 `clang++ -std=c++17 -Wall -Wextra -fsyntax-only` 通过（仅保留非 Windows 分支原有的未使用变量警告）；Makefile dry-run 确认 `radar_pov.cpp` 仍纳入构建。当前 macOS 环境没有 `msbuild`/Windows SDK，Windows Release x64 构建留待 C 级里程碑执行。
+- Demo 测试：本阶段实际修改了热路径，必须触发 C 级完整功能回归；当前未执行，等待 Windows 环境完成 T/CT POV、地图旋转、颜色、freecam、切换观察目标及死亡/回合切换验证。
+- 下一步：先完成阶段 5 和本阶段的 C 级验证；若 profiling 证明仍有明显开销，再单独评估阶段 6 的其余可选缓存，否则进入阶段 7 前先确认本轮功能稳定。
+
 ## 阶段 7：最后再拆分文件
 
 前置条件：功能和 resolver 已经过前述阶段验证。
