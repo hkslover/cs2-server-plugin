@@ -26,6 +26,7 @@ SRC_FILES = main.cpp \
 			mem_utils.cpp \
 			record_status_bridge.cpp \
 			radar_pov.cpp \
+			radar_pov/radar_resolver.cpp \
 			./deps/easywsclient/easywsclient.cpp \
 			./deps/hl2sdk/tier1/convar.cpp
 

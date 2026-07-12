@@ -157,6 +157,7 @@ del *.pdb</Command>
     <ClInclude Include="deps\minhook\include\MinHook.h" />
     <ClInclude Include="mem_utils.h" />
     <ClInclude Include="radar_pov.h" />
+    <ClInclude Include="radar_pov\radar_resolver.h" />
     <ClInclude Include="record_status_bridge.h" />
   </ItemGroup>
   <ItemGroup>
@@ -169,6 +170,7 @@ del *.pdb</Command>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mem_utils.cpp" />
     <ClCompile Include="radar_pov.cpp" />
+    <ClCompile Include="radar_pov\radar_resolver.cpp" />
     <ClCompile Include="record_status_bridge.cpp" />
   </ItemGroup>
   <ItemGroup>

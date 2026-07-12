@@ -13,6 +13,12 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Header Files\Radar POV">
+      <UniqueIdentifier>{B1B1FBB5-A6E4-47B1-AE27-8A1E6E8AA101}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Radar POV">
+      <UniqueIdentifier>{A30D9C68-3E9E-4C2B-AF75-25C4C7FBCF3A}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cdll_interfaces.h">
@@ -26,6 +32,9 @@
     </ClInclude>
     <ClInclude Include="radar_pov.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="radar_pov\radar_resolver.h">
+      <Filter>Header Files\Radar POV</Filter>
     </ClInclude>
     <ClInclude Include="record_status_bridge.h">
       <Filter>Header Files</Filter>
@@ -61,6 +70,9 @@
     </ClCompile>
     <ClCompile Include="radar_pov.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="radar_pov\radar_resolver.cpp">
+      <Filter>Source Files\Radar POV</Filter>
     </ClCompile>
     <ClCompile Include="record_status_bridge.cpp">
       <Filter>Source Files</Filter>
