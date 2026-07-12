@@ -242,7 +242,7 @@
 
 ### 本次执行记录：阶段 7 第一子步骤（resolver）
 
-- 实际修改 commit ID：待提交（本次仅修改工作区，未自动创建 commit）。
+- 实际修改 commit ID：`08be538`（`refactor(radar-pov): split resolver into module`）。
 - 代码状态：已将完整 resolver 搬入 `cs2-server-plugin/radar_pov/radar_resolver.cpp`，并以 `radar_resolver.h` 的 `ResolvedState` 作为唯一输出边界；`radar_pov.cpp` 只保留兼容包装，pattern、候选唯一性、边界检查、日志和 7-hook 目标没有改变。
 - 工程纳入：Makefile、Visual Studio 工程和 filters 均已加入 `radar_pov/` 下的新源文件；相关 Radar 代码开始集中到独立目录。
 - A 级检查：`git diff --check` 通过；`xmllint --noout cs2-server-plugin.vcxproj cs2-server-plugin.vcxproj.filters` 通过；POSIX 分支 `clang++ -std=c++17 -Wall -Wextra -fsyntax-only` 通过；Makefile dry-run 确认新 resolver 已纳入构建。
