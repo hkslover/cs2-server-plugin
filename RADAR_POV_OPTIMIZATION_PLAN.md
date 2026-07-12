@@ -195,6 +195,16 @@
 - 模糊或多候选结果会明确失败关闭，不会选择低置信度地址。
 - 游戏更新后的失败日志足以定位具体 resolver。
 
+### 本次执行记录
+
+- 实际修改 commit ID：`ee7b266`（`hardening(radar-pov): validate resolver candidates and bounds`）。
+- 代码状态：已完成；resolver 现在优先使用 PE `.text` 范围，函数起点/大小、相对调用和扫描窗口均受边界限制。ConVar、radar mode/update、players、getLocal/getObs、slot helpers、GetEntityBySlot、SetRadarIconType、GetCompColorArgb、RadarIconColor 及其 player-index helper 均改为结构关系校验；多候选明确失败，不再使用 `earlyUnique[2]` 或无条件首个 pattern 命中。
+- 诊断日志：解析结果输出 target RVA、解析来源和候选数量；安装前再次验证 7 个 hook target 的可执行函数范围，外部 vtable target 通过可执行页检查。
+- 当前 `client.dll` 静态复核：`RadarIconColor` 短前缀命中 2 个，但只有 `0xe460e0` 具备唯一的 player-index 调用关系；其余 resolver 候选链均为唯一，未发现当前基线版本误判为多候选。
+- A 级检查：`git diff --check` 通过；POSIX 分支 `clang++ -std=c++17 -Wall -Wextra -fsyntax-only` 通过（仅保留非 Windows 分支原有的未使用变量警告）；Makefile dry-run 确认 `radar_pov.cpp` 和 `mem_utils.cpp` 已纳入构建。当前 macOS 环境没有 `msbuild`/Windows SDK，Windows Release x64 构建留待 C 级里程碑执行。
+- Demo 测试：本阶段必须触发 C 级完整功能回归；当前未执行，等待 Windows 环境验证 7 个 target 的当前 RVA、更新后的失败关闭日志及 POV 雷达行为。
+- 下一步：先完成阶段 5 的 C 级验证，再评估阶段 6；未经该验证不作为最终稳定版本发布。
+
 ## 阶段 6：只在必要时优化热路径
 
 前置条件：已有实际 profiling 或明确的帧耗时证据。
