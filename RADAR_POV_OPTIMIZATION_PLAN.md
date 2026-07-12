@@ -104,6 +104,14 @@
 - 正常卸载、再次安装均成功。
 - 在阶段 1～3 合并后的 B 级测试中确认 Demo 行为不变。
 
+### 本次执行记录
+
+- 实际修改 commit ID：`fe38675`（`fix(radar-pov): precisely roll back owned hooks`）。
+- 代码状态：已完成；已登记本功能创建的 hook target，安装失败和正常卸载均按 target 逐个 disable/remove，并记录 MinHook 生命周期所有权。
+- A 级检查：`git diff --check` 通过；POSIX 分支 `clang++ -fsyntax-only` 通过（仅有该分支原有的未使用变量警告）；Makefile dry-run 确认 `radar_pov.cpp` 已纳入构建；当前 macOS 环境没有 `msbuild`/Windows SDK，Windows Release x64 构建留待 Windows 环境执行。
+- Demo 测试：本阶段不单独启动 Demo，等待阶段 1～3 合并后的 B 级里程碑统一验证。
+- 下一步：阶段 2 已满足代码级验收，可进入阶段 3。
+
 ## 阶段 3：7 个 hook 批量启用
 
 前置条件：阶段 2 已通过。
