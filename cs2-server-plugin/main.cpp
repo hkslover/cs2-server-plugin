@@ -1,4 +1,8 @@
 #include <atomic>
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <deque>
 #include <thread>
 #include <fstream>
 #include <mutex>
@@ -6,6 +10,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
 #include <easywsclient.hpp>
 #include "icvar.h"
@@ -84,7 +89,6 @@ ISource2Client* client = NULL;
 FrameStageNotifyFn originalFrameStageNotify = NULL;
 ICvar* g_pCVar = NULL;
 std::thread* wsConnectionThread = NULL;
-WebSocket::pointer ws;
 string gameInfoPath;
 string gameInfoBackupPath;
 const char* demoPath = NULL;
@@ -93,16 +97,63 @@ bool isPlayingDemo = false;
 std::atomic<int> currentTick{-1};
 std::atomic<bool> isQuitting{false};
 bool shouldDeleteLogFile = true;
+std::mutex logMutex;
+std::string logFilePath;
+bool logFilePathInitialized = false;
 std::mutex sequencesMutex;
 std::queue<Sequence> sequences;
 std::mutex pendingCommandsMutex;
 std::queue<std::string> pendingCommands;
+std::atomic<bool> wsConnected{false};
+std::atomic<bool> exitAfterWebSocketAck{false};
+
+struct OutboundWebSocketMessage {
+    std::string payload;
+    std::string name;
+    bool durable;
+    int priority;
+};
+
+const size_t MAX_OUTBOUND_WEBSOCKET_MESSAGES = 512;
+const size_t MAX_DURABLE_WEBSOCKET_MESSAGES = 128;
+std::mutex outboundWebSocketMessagesMutex;
+std::deque<OutboundWebSocketMessage> outboundWebSocketMessages;
+std::deque<OutboundWebSocketMessage> durableWebSocketMessages;
+std::atomic<unsigned long> droppedWebSocketMessages{0};
 std::atomic<bool> captureInProgress{false};
 std::chrono::steady_clock::time_point captureStartTime;
 std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 
+std::string ResolveLogFilePath()
+{
+    const char* configuredPath = getenv("CSDM_LOG_PATH");
+    if (configuredPath != NULL && configuredPath[0] != '\0') {
+        return std::string(configuredPath);
+    }
+    return "csdm.log";
+}
+
+void EnsureLogFilePath()
+{
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (!logFilePathInitialized) {
+        logFilePath = ResolveLogFilePath();
+        logFilePathInitialized = true;
+    }
+}
+
 void LogToFile(const char* pMsg) {
-    FILE* pFile = fopen("csdm.log", "a");
+    EnsureLogFilePath();
+    std::lock_guard<std::mutex> lock(logMutex);
+    FILE* pFile = fopen(logFilePath.c_str(), "a");
+    if (pFile == NULL && logFilePath != "csdm.log")
+    {
+        // A configured host-managed path may disappear or be inaccessible.
+        // Preserve standalone-plugin behavior by falling back to the legacy
+        // relative log file instead of silently losing all file diagnostics.
+        logFilePath = "csdm.log";
+        pFile = fopen(logFilePath.c_str(), "a");
+    }
     if (pFile == NULL)
     {
         return;
@@ -114,7 +165,9 @@ void LogToFile(const char* pMsg) {
 
 void DeleteLogFile()
 {
-    remove("csdm.log");
+    EnsureLogFilePath();
+    std::lock_guard<std::mutex> lock(logMutex);
+    remove(logFilePath.c_str());
 }
 
 void Log(const char* msg, ...)
@@ -303,13 +356,152 @@ ISource2EngineToClient* GetEngine()
     return engineToClient;
 }
 
-void SendMsg(json msg) {
-    if (ws != NULL) {
-        ws->send(msg.dump());
+bool IsDurableWebSocketMessage(const std::string& name)
+{
+    return name == "record_status" || name == "demo_started" || name == "demo_done";
+}
+
+int GetWebSocketMessagePriority(const std::string& name)
+{
+    if (name == "demo_done" || name == "session_exit_ack") {
+        return 2;
     }
-    else {
-        Log("Cannot send message, WebSocket not connected");
+    if (name == "record_status" || name == "demo_started") {
+        return 1;
     }
+    return 0;
+}
+
+bool RemoveLowerPriorityMessageLocked(int priority)
+{
+    for (auto it = outboundWebSocketMessages.begin(); it != outboundWebSocketMessages.end(); ++it) {
+        if (it->priority < priority) {
+            outboundWebSocketMessages.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void EnqueueWebSocketMessage(OutboundWebSocketMessage message)
+{
+    bool dropped = false;
+    {
+        std::lock_guard<std::mutex> lock(outboundWebSocketMessagesMutex);
+        if (outboundWebSocketMessages.size() >= MAX_OUTBOUND_WEBSOCKET_MESSAGES) {
+            if (!RemoveLowerPriorityMessageLocked(message.priority)) {
+                dropped = true;
+            }
+        }
+        if (!dropped) {
+            outboundWebSocketMessages.push_back(message);
+        }
+    }
+    if (dropped) {
+        unsigned long dropCount = ++droppedWebSocketMessages;
+        Log("Dropping outbound WebSocket message name=%s priority=%d drop_count=%lu", message.name.c_str(), message.priority, dropCount);
+    }
+}
+
+void SendMsg(const json& msg) {
+    try {
+        std::string name = msg.value("name", std::string());
+        if (name.empty()) {
+            Log("Cannot queue WebSocket message without name");
+            return;
+        }
+        OutboundWebSocketMessage outbound;
+        outbound.payload = msg.dump();
+        outbound.name = name;
+        outbound.durable = IsDurableWebSocketMessage(name);
+        outbound.priority = GetWebSocketMessagePriority(name);
+        EnqueueWebSocketMessage(outbound);
+    }
+    catch (const std::exception& error) {
+        Log("Cannot serialize outbound WebSocket message: %s", error.what());
+    }
+}
+
+void RememberDurableWebSocketMessage(const OutboundWebSocketMessage& message)
+{
+    if (!message.durable) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(outboundWebSocketMessagesMutex);
+    durableWebSocketMessages.push_back(message);
+    while (durableWebSocketMessages.size() > MAX_DURABLE_WEBSOCKET_MESSAGES) {
+        durableWebSocketMessages.pop_front();
+    }
+}
+
+void ReplayDurableWebSocketMessages(WebSocket::pointer socket)
+{
+    std::vector<OutboundWebSocketMessage> replay;
+    {
+        std::lock_guard<std::mutex> lock(outboundWebSocketMessagesMutex);
+        replay.assign(durableWebSocketMessages.begin(), durableWebSocketMessages.end());
+    }
+    for (const auto& message : replay) {
+        if (socket->getReadyState() != WebSocket::OPEN || isQuitting) {
+            return;
+        }
+        socket->send(message.payload);
+    }
+    if (!replay.empty()) {
+        Log("Replayed %zu durable WebSocket events after reconnect", replay.size());
+    }
+}
+
+void DrainOutboundWebSocketMessages(WebSocket::pointer socket)
+{
+    while (socket->getReadyState() == WebSocket::OPEN && !isQuitting) {
+        OutboundWebSocketMessage message;
+        bool hasMessage = false;
+        {
+            std::lock_guard<std::mutex> lock(outboundWebSocketMessagesMutex);
+            if (!outboundWebSocketMessages.empty()) {
+                message = outboundWebSocketMessages.front();
+                outboundWebSocketMessages.pop_front();
+                hasMessage = true;
+            }
+        }
+        if (!hasMessage) {
+            return;
+        }
+        socket->send(message.payload);
+        RememberDurableWebSocketMessage(message);
+    }
+}
+
+void DiscardTransientOutboundWebSocketMessages()
+{
+    size_t discarded = 0;
+    {
+        std::lock_guard<std::mutex> lock(outboundWebSocketMessagesMutex);
+        auto next = std::remove_if(
+            outboundWebSocketMessages.begin(),
+            outboundWebSocketMessages.end(),
+            [&discarded](const OutboundWebSocketMessage& message) {
+                if (message.durable) {
+                    return false;
+                }
+                ++discarded;
+                return true;
+            });
+        outboundWebSocketMessages.erase(next, outboundWebSocketMessages.end());
+    }
+    if (discarded > 0) {
+        Log("Discarded %zu transient WebSocket messages after disconnect", discarded);
+    }
+}
+
+void QueueExitAfterWebSocketAck()
+{
+    if (!exitAfterWebSocketAck.exchange(false)) {
+        return;
+    }
+    Log("Session-end acknowledgement sent; queueing graceful CS2 quit");
+    QueueEngineCommand("quit");
 }
 
 void SendStatusOk() {
@@ -526,33 +718,64 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
 void HandleWebSocketMessage(const std::string& message)
 {
     Log("[%d] Message received: %s", currentTick.load(), message.c_str());
+    try {
+        json msg = json::parse(message.c_str());
+        if (!msg.is_object() || !msg.contains("name") || !msg["name"].is_string()) {
+            Log("Ignoring malformed WebSocket command envelope");
+            return;
+        }
 
-    json msg = json::parse(message.c_str());
-    if (!msg.contains("name")) {
-        return;
+        std::string name = msg["name"];
+        if (name == "playdemo") {
+            if (!msg.contains("payload") || !msg["payload"].is_string()) {
+                Log("Ignoring playdemo command with invalid payload");
+                return;
+            }
+            SendStatusOk();
+
+            string requestedDemoPath = msg["payload"];
+            activeDemoPath = requestedDemoPath;
+
+            LoadSequencesFile(requestedDemoPath);
+
+            string cmd = "playdemo \"" + requestedDemoPath + "\"";
+            QueueEngineCommand(cmd);
+            SendMsg(BuildDemoStartedMessage(activeDemoPath));
+        }
+        else if (name == "capture-player-view") {
+            Log("Capturing player view");
+            QueueEngineCommand("getposcopy");
+            // The "screenshot" command works only on Windows when the -tools launch option is set.
+            // As a workaround, we use the startmovie command to take a screenshot.
+            QueueEngineCommand("hideconsole");
+            QueueEngineCommand("startmovie csdmcamera jpg");
+            captureStartTime = std::chrono::steady_clock::now();
+            captureInProgress = true;
+        }
+        else if (name == "end_produce_session") {
+            if (!msg.contains("payload") || !msg["payload"].is_object() ||
+                !msg["payload"].contains("request_id") || !msg["payload"]["request_id"].is_string()) {
+                Log("Ignoring end_produce_session command with invalid payload");
+                return;
+            }
+            std::string requestID = msg["payload"]["request_id"];
+            if (requestID.empty()) {
+                Log("Ignoring end_produce_session command with empty request_id");
+                return;
+            }
+            // The WebSocket owner sends the acknowledgement before it queues
+            // quit on the engine thread. This lets the host classify the
+            // subsequent socket close as an expected session completion.
+            SendMsg(BuildSessionExitAckMessage(requestID));
+            exitAfterWebSocketAck = true;
+            Log("Accepted graceful session end request id=%s", requestID.c_str());
+        }
+        else {
+            Log("Ignoring unknown WebSocket command: %s", name.c_str());
+        }
     }
-
-    if (msg["name"] == "playdemo" && msg.contains("payload") && msg["payload"].is_string()) {
-        SendStatusOk();
-
-        string requestedDemoPath = msg["payload"];
-        activeDemoPath = requestedDemoPath;
-
-        LoadSequencesFile(requestedDemoPath);
-
-        string cmd = "playdemo \"" + requestedDemoPath + "\"";
-        QueueEngineCommand(cmd);
-        SendMsg(BuildDemoStartedMessage(activeDemoPath));
-    }
-    else if (msg["name"] == "capture-player-view") {
-        Log("Capturing player view");
-        QueueEngineCommand("getposcopy");
-        // The "screenshot" command works only on Windows when the -tools launch option is set.
-        // As a workaround, we use the startmovie command to take a screenshot.
-        QueueEngineCommand("hideconsole");
-        QueueEngineCommand("startmovie csdmcamera jpg");
-        captureStartTime = std::chrono::steady_clock::now();
-        captureInProgress = true;
+    catch (const std::exception& error) {
+        Log("Ignoring malformed WebSocket command: %s", error.what());
     }
 }
 
@@ -573,24 +796,40 @@ int GetWebSocketServerPort() {
 
 void ConnectToWebsocketServer() {
     int port = GetWebSocketServerPort();
-    string url = "ws://localhost:" + std::to_string(port) + "?process=game";
+    // easywsclient parses a path separately from the authority. Keep the
+    // slash before the query string, otherwise it sends GET / and silently
+    // drops process=game during the WebSocket handshake.
+    string url = "ws://localhost:" + std::to_string(port) + "/?process=game";
     Log("Connecting to WebSocket server on port %d...", port);
-    ws = WebSocket::from_url(url);
-    if (ws == NULL)
+    WebSocket::pointer socket = WebSocket::from_url(url);
+    if (socket == NULL)
     {
         Log("Failed to connect to WebSocket server.");
         return;
     }
 
     Log("Connected to WebSocket server.");
-    while (ws->getReadyState() != WebSocket::CLOSED && !isQuitting) {
-        ws->poll();
-        ws->dispatch(HandleWebSocketMessage);
+    wsConnected = true;
+    ReplayDurableWebSocketMessages(socket);
+    while (socket->getReadyState() != WebSocket::CLOSED && !isQuitting) {
+        DrainOutboundWebSocketMessages(socket);
+        QueueExitAfterWebSocketAck();
+        socket->poll(100);
+        socket->dispatch([](const std::string& message) {
+            HandleWebSocketMessage(message);
+        });
+        DrainOutboundWebSocketMessages(socket);
+        QueueExitAfterWebSocketAck();
     }
 
+    wsConnected = false;
+    // session_exit_ack is intentionally not replayed: a reconnect must not
+    // confirm a later session's command. The host falls back to PID shutdown
+    // if this one-shot acknowledgement cannot complete the close handshake.
+    exitAfterWebSocketAck = false;
+    DiscardTransientOutboundWebSocketMessages();
     Log("Disconnected from WebSocket server.");
-    delete ws;
-    ws = NULL;
+    delete socket;
 }
 
 void ConnectToWebsocketServerLoop() {
@@ -599,13 +838,9 @@ void ConnectToWebsocketServerLoop() {
             break;
         }
 
-        if (ws != NULL) {
-            continue;
-        }
-
         ConnectToWebsocketServer();
 
-        if (ws == NULL) {
+        if (!isQuitting) {
             Log("Retrying in 2s...");
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         }
@@ -646,6 +881,7 @@ bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
 void Shutdown()
 {
     isQuitting = true;
+    wsConnected = false;
 
     // Best-effort: remove radar hooks before the rest of teardown.
     RadarPov_Uninstall();
@@ -658,12 +894,9 @@ void Shutdown()
     ConVar_Unregister();
 #endif
 
-    if (ws != NULL) {
-        ws->close();
-    }
-
     if (wsConnectionThread != NULL) {
         wsConnectionThread->join();
+        delete wsConnectionThread;
         wsConnectionThread = NULL;
     }
 }
@@ -789,7 +1022,7 @@ CON_COMMAND(csdm_info, "Prints CS:DM plugin info")
         RadarPov_IsEnabled() ? 1 : 0,
         RadarPov_IsInstalled() ? 1 : 0);
 
-    if (ws != NULL) {
+    if (wsConnected) {
         Log("WebSocket connected");
     }
     else {
