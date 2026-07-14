@@ -20,3 +20,4 @@ nlohmann::json BuildRecordStatusMessage(
     const ActionMetadata& metadata);
 nlohmann::json BuildDemoStartedMessage(const std::string& demoPath);
 nlohmann::json BuildDemoDoneMessage(const std::string& demoPath, const std::string& reason);
+nlohmann::json BuildSessionExitAckMessage(const std::string& requestID);

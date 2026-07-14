@@ -84,3 +84,13 @@ nlohmann::json BuildDemoDoneMessage(const std::string& demoPath, const std::stri
     };
     return msg;
 }
+
+nlohmann::json BuildSessionExitAckMessage(const std::string& requestID) {
+    nlohmann::json msg;
+    msg["name"] = "session_exit_ack";
+    msg["payload"] = {
+        {"request_id", requestID},
+        {"ts_ms", GetUnixTimestampMs()},
+    };
+    return msg;
+}

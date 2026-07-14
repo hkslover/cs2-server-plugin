@@ -17,6 +17,22 @@ Compared with the upstream CS2 plugin in `cs-demo-manager`, this repo includes i
 
 The goal is to keep plugin behavior compatible with upstream while enabling real-time recording state tracking in the external tool.
 
+## Host integration environment
+
+When launched by CS2 Highlight Tool, the host supplies the following optional environment variables:
+
+- `CSDM_WS_PORT`: loopback WebSocket port for production control. If absent or invalid, the plugin keeps the standalone compatibility default of `4574`.
+- `CSDM_LOG_PATH`: absolute path for the plugin diagnostic log. If absent, or if that path cannot be opened, the plugin falls back to `csdm.log` in its working directory.
+
+All `easywsclient` access is owned by the plugin's WebSocket thread. Other game/plugin threads enqueue bounded outbound events; `record_status`, `demo_started`, and `demo_done` are retained briefly and replayed on reconnect, while the generic `status` acknowledgement is intentionally never replayed.
+
+After the host has completed a successful production queue, it may send
+`end_produce_session` with a `request_id`. The plugin replies once with
+`session_exit_ack` using that ID, drains the acknowledgement from its WebSocket
+thread, then queues CS2's `quit` command on the game thread. This acknowledgement
+is intentionally not replayed after reconnect; hosts without this protocol fall
+back to their PID-close path.
+
 ## Build (Windows)
 
 Requirements:
