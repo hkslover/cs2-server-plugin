@@ -26,15 +26,23 @@ During demo first-person follow (`spec_mode` / `spec_player`):
 Hook_RadarUpdate (scope)
   PreparePovContext:
     observed pawn, slot, team (from pawn m_iTeamNum @ +0x3E7)
+    → observer-chain model: getObs(local) pawn
+    → direct-local fallback: getLocal() already IS the POV player pawn
+      (no observer chain; newer demo playback) — use it as self
   ├─ getLocal()                 → observed pawn
   ├─ GetEntityBySlot(0 / -1)    → observed controller slot
-  ├─ demo/HLTV (+0x2B0)         → 0 (this frame only)
+  ├─ demo/HLTV (+0x2B0 = IVEngineClient::IsHLTV) → 0 (this frame only)
   ├─ findPlayerBySlot(spec)     → nullptr
   ├─ SetRadarIconType           → teammates only: type 0x11 → 9 (T) / 0xD (CT)
-  └─ RadarIconColor (e460e0)
+  └─ RadarIconColor (e62bc0)
         native update
         then ForceCompetitiveIconColor (teammates only, engine ARGB palette)
 ```
+
+The direct-local fallback triggers only when the observer chain fails to
+resolve a pawn AND `getLocal()` itself is a live player pawn on team T/CT.
+Without it, that build silently degrades to the show-all fail-safe (native
+demo radar) — i.e. the feature appears completely inactive.
 
 ### Why identity alone is not enough
 
@@ -58,18 +66,19 @@ Hook_RadarUpdate (scope)
 
 ## Hooks (7)
 
-| # | Name (log) | Target role (last known RVA) | Required | Role |
+| # | Name (log) | Target role (RVA, PE `0x6AA1AE5E`) | Required | Role |
 | --- | --- | --- | --- | --- |
-| 1 | `radar_update` | Outer update ~`0xE25550` | yes | Thread-local POV scope; show-all fail-safe |
-| 2 | `getLocal` | ~`0xC10EA0` | yes | Observed **pawn** as self |
-| 3 | `radar_demo_state` | Engine vtable `+0x2B0` | yes | Scoped non-demo |
-| 4 | `getEntityBySlot` | ~`0x926920` | yes | Slot `0`/`-1` → observed controller slot |
-| 5 | `findPlayerBySlot` | players-loop call site | yes (product) | Hide freecam spectator slot |
-| 6 | `setRadarIconType` | ~`0xE39320` | yes (current) | Teammate `0x11` → `9`/`0xD` (panel set for colour) |
-| 7 | `radarIconColor` | ~`0xE460E0` | yes (current) | After native: force teammate ARGB |
+| 1 | `radar_update` | Outer update `0xE408D0` (vtable `CCSGO_HudRadar` +`0x2E0`) | yes | Thread-local POV scope; show-all fail-safe |
+| 2 | `getLocal` | `0xC29DA0` | yes | Observed **pawn** as self |
+| 3 | `radar_demo_state` | Engine vtable `+0x2B0` (`IsHLTV`) | yes | Scoped non-demo |
+| 4 | `getEntityBySlot` | `0x93F780` | yes | Slot `0`/`-1` → observed controller slot |
+| 5 | `findPlayerBySlot` | `0xA8BDC0` (players-loop call site) | yes (product) | Hide freecam spectator slot |
+| 6 | `setRadarIconType` | `0xE55E00` | yes (current) | Teammate `0x11` → `9`/`0xD` (panel set for colour) |
+| 7 | `radarIconColor` | `0xE62BC0` | yes (current) | After native: force teammate ARGB |
 
-Helpers (not hooked): `getObs` (~`0x813F30`, pawn `+0x1220`), `getPlayerSlot`,
-`GetCompColorArgb` (~`0x849370`), `ResolvePlayerByIndex` (~`0xA732C0`).
+Helpers (not hooked): `getObs` (`0x82C770`, pawn `+0x1220`), `getPlayerSlot`
+(`0x918130`), `GetCompColorArgb` (`0x861BB0`), `ResolvePlayerByIndex`
+(`0xA8C160`).
 
 ### `setRadarIconType` (what it does)
 
@@ -93,25 +102,74 @@ fallback `playerIndex % 5` if unset; `GetCompColorArgb` → SetColor on panels
 - Lazy refresh in `IsPovTeammateTeam` if still invalid.
 - Never competitive-colour enemies.
 
-## Last known-good anchors (PE `0x6A500273`)
+## Last known-good anchors (PE `0x6AA1AE5E`, build 2026-09-09)
+
+Resolver re-validated statically against this build (2026-09-17, radare2):
+every step of `ResolveRadarFunctions` resolves uniquely and all struct
+offsets are identical to the previous build. Only code RVAs moved.
 
 | Role | RVA (image base `0x180000000`) | Rediscovery |
 | --- | --- | --- |
-| Outer radar update | `0xE25550` | Caller of mode + players; `test dl,dl` + `lea rsi,[rcx-20h]` |
-| radar_mode | `0xE1F000` | From cvar `cl_radar_show_all_players_when_spectating` |
-| Show-all flag | `radar+0x17760` | `and byte ptr [radar+off], ~1` in mode |
-| Players loop | `0xE328A0` | Large call after mode in outer update |
-| getLocal | `0xC10EA0` | Early call in players |
-| getObs | `0x813F30` | Imm `0x1220` near start |
-| GetEntityBySlot | `0x926920` | `xor ecx,ecx; call X` then `call IsSpectatorCheck` in icon colour |
-| IsSpectatorCheck | `0x85B540` | Prologue + `cmp [rbx+0x3E7],1` (`mov edi,eax` may be `8B F8` or `89 C7`) |
-| SetRadarIconType | `0xE39320` | `40 56 57 41 56 ... E8 getLocal` |
-| RadarIconColor | `0xE460E0` | Starts `test rdx,rdx`; uses GetEntityBySlot(0) |
-| GetCompColorArgb | `0x849370` | `cl_teammate_color_*` switch |
-| m_iTeamNum | entity `+0x3E7` | Byte |
+| Outer radar update (vtable `CCSGO_HudRadar` +`0x2E0`) | `0xE408D0` | Caller of mode + players; `test dl,dl` + `lea rsi,[rcx-20h]` |
+| radar_mode | `0xE3A380` | From cvar `cl_radar_show_all_players_when_spectating` (ConVar obj `0x1823E0100`) |
+| Show-all flag | `radar+0x17760` bit0 | `and byte ptr [radar+off], ~1` clear / `or ...1` set in mode |
+| Spotted/heard bitmask | `radar+0x17770` | per-slot bit; writer fn `0xE4CC30` (sound/radio events) |
+| Players loop | `0xE4EF90` | Post-mode call in outer update; getPlayerSlot+findPlayerBySlot structure |
+| getLocal | `0xC29DA0` | Early call in players / mode / setRadarIconType |
+| getObs (observer target pawn) | `0x82C770` | `mov rcx,[rcx+0x1220]` → services → `[+0x100]` |
+| GetEntityBySlot | `0x93F780` | `xor ecx,ecx; call` then `call IsSpectatorCheck` in icon colour |
+| IsSpectatorCheck | `0x873D80` | Prologue + `cmp [rbx+0x3E7],1` |
+| IsSpectator(pawn) | `0x8B0F00` | `mov edx,[rcx+0x13D0]` handle resolve (mode / icon type) |
+| SetRadarIconType | `0xE55E00` | `40 56 57 41 56 ... E8 getLocal` |
+| RadarIconColor | `0xE62BC0` | Starts `test rdx,rdx`; uses GetEntityBySlot(0) |
+| GetCompColorArgb | `0x861BB0` | `cl_teammate_color_*` switch |
+| GetCompTeammateColor (netvar read) | `0x861D10` | Returns `m_iCompTeammateColor` or -1 (gate `[0x1823CC6C8]`) |
+| ResolvePlayerByIndex | `0xA8C160` | `mov ecx,[rsi+0x158]; call` in icon colour |
+| getPlayerSlot | `0x918130` | `lea rdx,[rsp+24]; mov rcx,rax; call` in players |
+| findPlayerBySlot | `0xA8BDC0` | `mov ecx,edi; call` in players |
+| m_iTeamNum | entity `+0x3E7` | Byte (2=CT, 3=T); confirmed on pawn AND controller |
 | m_iCompTeammateColor | controller `+0x850` | Int 0–4 or unset |
+| Observer services | pawn `+0x1220` | Unchanged |
+| IsObserver vtable | `+0xAA0` | Unchanged |
+| IsPlayerPawn vtable | `+0x4D8` | Unchanged (see `0x82C794`) |
+| Observer-target handle | pawn `+0x13D0` | `-1` = not observing |
+
+### THE switch (in-game vs demo/HLTV radar) — confirmed via SDK + RE
+
+`mov rcx,[0x1823C8348]; mov rax,[rcx]; call [rax+0x2B0]` is
+**`IVEngineClient::IsHLTV()`** (engine vtable `+0x2B0`; see
+`deps/hl2sdk/public/cdll_int.h`). The radar path consumes it at ~21 sites in
+`client.dll` (`0xE30xxx`–`0xE6Fxxx`); key ones:
+
+- radar_mode `0xE3A3DB` / `0xE3A4D7` — sets show-all bit0 (together with the
+  `cl_radar_show_all_players_when_spectating` cvar) when `IsHLTV() ||
+  IsSpectator(local)`
+- setRadarIconType `0xE55E45` — spectator/demo forces the spectator type path
+  (skips live same-team competitive-type logic)
+- iconColor `0xE62C33` — spectator/demo skips the live competitive RGB branch
+
+Players-loop draw gate (`0xE4F4FB`–`0xE4F525`): teammates/self are always
+drawn; enemies are drawn only when `radar+0x17760` bit0 (show-all) **or** the
+`radar+0x17770` spotted/heard bit is set. Forcing `IsHLTV() -> 0` plus local
+identity = the observed pawn therefore yields the exact live first-person
+radar (teammates coloured, enemies only when spotted).
 
 Prefer semantic re-resolve over these numbers after an update.
+
+### Previous build anchors (PE `0x6A500273`, 2026-07) — historical
+
+| Role | RVA |
+| --- | --- |
+| Outer radar update | `0xE25550` |
+| radar_mode | `0xE1F000` |
+| Players loop | `0xE328A0` |
+| getLocal | `0xC10EA0` |
+| getObs | `0x813F30` |
+| GetEntityBySlot | `0x926920` |
+| IsSpectatorCheck | `0x85B540` |
+| SetRadarIconType | `0xE39320` |
+| RadarIconColor | `0xE460E0` |
+| GetCompColorArgb | `0x849370` |
 
 ### Pattern API (`radar_pov.cpp`)
 
@@ -139,24 +197,35 @@ Radar POV: GetEntityBySlot 0 -> observed slot N
 Radar POV: force-color teammate type=9|13 team=T selfTeam=T netvar=... idx=... argb=0x... panels=6 playerIndex=...
 ```
 
+Direct-local variant (newer demo playback; `spectatorSlot -1`, pawn == observed):
+
+```text
+Radar POV: local pawn is the POV player (team 2|3) — using it directly
+Radar POV: active — pawn ... -> observed ... (slot N team 2|3, spectatorSlot -1) [direct]
+```
+
 Must **not** appear:
 
 - `team 0` on active line after POV is stable (team read failed → no colours)
 - `force-color` with `team != selfTeam` (enemy leak)
 - `shouldApplyCompColor` / `getCompTeammateColor` MinHook lines (removed)
 - `cl_radar_show_all_players_when_spectating` from plugin QueueEngineSetup (empty)
+- persistent `getLocal returned no pawn` / `no observer target yet — show-all ON`
+  (POV activation failing every frame → feature inactive; check the
+  direct-local fallback conditions)
 
 ## Failure matrix
 
 | Log / visual | Action |
 | --- | --- |
-| `getEntityBySlot=0` | Re-resolve `FUN_180926920` via icon-renderer call chain |
-| `forceColor=0` | Re-resolve `e460e0` + `849370` |
+| `getEntityBySlot=0` | Re-resolve via icon-renderer call chain (now `FUN_18093F780`) |
+| `forceColor=0` | Re-resolve iconColour (`0xE62BC0`) + `0x861BB0` |
 | `active ... team 0` | Prefer pawn `+0x3E7`; fix `RefreshPovSelfTeam` |
 | Allies solid team colour, no force-color lines | Hook not running or type filter excluding all |
 | Enemies multi-coloured | `IsPovTeammateTeam` too loose |
 | Extra freecam dot | `findPlayerBySlot` / wrong `g_spectatorSlot` |
 | Install shape errors | Outer update / mode prologue masks |
+| Feature completely inactive in demo | `PreparePovContext` observer chain fails AND direct-local fallback conditions not met — capture `no observer target yet` log line details |
 
 ## Update procedure after CS2 patch
 

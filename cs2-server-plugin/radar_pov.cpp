@@ -1,13 +1,10 @@
 #include "radar_pov.h"
-#include "mem_utils.h"
 #include "radar_pov/radar_resolver.h"
 
 #include <atomic>
 #include <cstdarg>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -16,20 +13,34 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <cstdint>
+#include <vector>
 #include <Windows.h>
 #include <MinHook.h>
+#include "mem_utils.h"
 using namespace MemUtils;
 #endif
 
 namespace {
 
 // =============================================================================
-// Design (Ghidra-backed): identity rewrite + teammate type + force ARGB
+// Design (RE-backed, validated against PE 0x6AA1AE5E): identity rewrite +
+// teammate type + force ARGB.
+//
+// THE demo switch: engine vtable +0x2B0 = IVEngineClient::IsHLTV()
+// (mov rcx,[global]; call [vtable+0x2B0]) — consumed at ~21 radar-path sites
+// (radar_mode, setRadarIconType, iconColor, ...). Scoped to 0 it flips the
+// whole radar into the live branch.
 //
 // Hooks (7):
-//   radar_update, getLocal, GetEntityBySlot, demo/HLTV, findPlayerBySlot,
-//   SetRadarIconType (teammate 0x11→9/0xD), RadarIconColor (force cl_teammate_color_*)
-// Colour-gate hooks (863200 / 8494d0) removed — force-color covers them.
+//   radar_update, getLocal, GetEntityBySlot, demo/HLTV (IsHLTV),
+//   findPlayerBySlot, SetRadarIconType (teammate 0x11→9/0xD),
+//   RadarIconColor (force cl_teammate_color_*)
+// Colour-gate hooks removed — force-color covers them.
+//
+// POV activation: observer chain (getObs(local)) first; if that fails but
+// getLocal() itself is a live T/CT player pawn, use it directly (newer demo
+// playback exposes the POV player as the local pawn with no observer chain).
 //
 // PE/pattern helpers live in mem_utils.h (MemUtils) for reuse by other features.
 // =============================================================================
@@ -66,6 +77,7 @@ std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
 std::atomic<int> g_logPovFail{0};
+std::atomic<int> g_logPovDirect{0};
 std::atomic<int> g_logSpectatorFilter{0};
 std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logGetEntityBySlot{0};
@@ -554,10 +566,38 @@ void PreparePovContext()
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         realPawn = nullptr;
     }
+    if (realPawn == nullptr) {
+        if (g_logPovFail.fetch_add(1) == 0) {
+            Log("Radar POV: getLocal returned no pawn — show-all ON (fail-safe)");
+        }
+        return;
+    }
+
     void* povPawn = ResolvePovSelfPawn(realPawn);
+    bool directLocal = false;
+    if (povPawn == nullptr) {
+        // Some demo playback builds expose the recorded POV player as the
+        // local pawn directly (getLocal returns the live pawn with no observer
+        // chain). Fall back to the local pawn itself when it is a live player
+        // pawn on team T/CT — the radar then renders that player's live
+        // first-person view instead of silently degrading to show-all.
+        const int localTeam = ReadEntityTeam(realPawn);
+        if (IsPlayerPawn(realPawn) &&
+            (localTeam == kTeamT || localTeam == kTeamCT)) {
+            povPawn = realPawn;
+            directLocal = true;
+            if (g_logPovDirect.fetch_add(1) == 0) {
+                Log("Radar POV: local pawn is the POV player (team %d) — using it directly",
+                    localTeam);
+            }
+        }
+    }
     if (povPawn == nullptr) {
         if (g_logPovFail.fetch_add(1) == 0) {
-            Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p", realPawn);
+            Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p team=%d "
+                "playerPawn=%d observing=%d",
+                realPawn, ReadEntityTeam(realPawn), IsPlayerPawn(realPawn) ? 1 : 0,
+                LooksObserving(realPawn) ? 1 : 0);
         }
         return;
     }
@@ -583,9 +623,9 @@ void PreparePovContext()
     }
     RefreshPovSelfTeam();
     if (g_logPovOk.fetch_add(1) == 0) {
-        Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)",
+        Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)%s",
             realPawn, povPawn, g_povFrame.selfSlot, g_povFrame.selfTeam,
-            g_povFrame.spectatorSlot);
+            g_povFrame.spectatorSlot, directLocal ? " [direct]" : "");
     }
 }
 
