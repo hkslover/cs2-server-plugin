@@ -18,6 +18,9 @@ using GetObserverTargetFn = void*(__fastcall*)(void* localPawn);
 using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
 using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
+// MSVC x64: __fastcall is accepted but ignored (single x64 ABI), so the
+// function pointer type omits it; identical to the engine-side call signature.
+using IsSlotEnemyOfFn = uint8_t(*)(void* localPawn, int slot);
 using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
 using RadarIconColorFn = void(__fastcall*)(void* radar, void* icon);
 using GetCompColorArgbFn = uint32_t*(__fastcall*)(uint32_t* outArgb, int colorIndex);
@@ -30,6 +33,7 @@ struct ResolvedFunctions {
     GetPlayerSlotFn getPlayerSlot = nullptr;
     FindPlayerBySlotFn findPlayerBySlot = nullptr;
     GetEntityBySlotFn getEntityBySlot = nullptr;
+    IsSlotEnemyOfFn isSlotEnemyOf = nullptr;
     SetRadarIconTypeFn setRadarIconType = nullptr;
     RadarIconColorFn radarIconColor = nullptr;
     GetCompColorArgbFn getCompColorArgb = nullptr;

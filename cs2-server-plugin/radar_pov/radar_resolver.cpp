@@ -1,10 +1,6 @@
 #include "radar_resolver.h"
 
 #include <cstdarg>
-#include <cstdint>
-#include <cstdio>
-#include <limits>
-#include <vector>
 
 namespace RadarPovResolver {
 
@@ -12,6 +8,11 @@ namespace {
 RadarPovLogFn g_log = nullptr;
 
 #ifdef _WIN32
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <vector>
+
 void Log(const char* fmt, ...)
 {
     if (g_log == nullptr) {
@@ -501,7 +502,14 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
         resolvePlayerCall("getPlayerSlot", kPatGetPlayerSlotCall, 8);
     const uintptr_t findPlayerBySlotFn =
         resolvePlayerCall("findPlayerBySlot", kPatFindPlayerBySlotCall, 2);
-    if (getPlayerSlotFn == 0 || findPlayerBySlotFn == 0) {
+    // Players-loop draw gate: `mov edx,[rsp+28]; mov rcx,[rsp+38]; call` — the
+    // per-slot "is this player an enemy of local" predicate (0x1808b0e00
+    // class). During demo playback its cvar path (0x182339278 != 0) returns true
+    // for every non-self slot, hiding unspotted teammates; the hook restores the
+    // live branch (team comparison).
+    const uintptr_t isSlotEnemyOfFn =
+        resolvePlayerCall("isSlotEnemyOf", "8B 54 24 28 48 8B 4C 24 38 E8", 9);
+    if (getPlayerSlotFn == 0 || findPlayerBySlotFn == 0 || isSlotEnemyOfFn == 0) {
         return false;
     }
 
@@ -663,6 +671,8 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
     g_origFindPlayerBySlot = findPlayerBySlotFn != 0
         ? reinterpret_cast<FindPlayerBySlotFn>(findPlayerBySlotFn)
         : nullptr;
+    resolved.functions.isSlotEnemyOf =
+        reinterpret_cast<IsSlotEnemyOfFn>(isSlotEnemyOfFn);
     g_origSetRadarIconType = reinterpret_cast<SetRadarIconTypeFn>(setRadarIconTypeFn);
 
     return true;

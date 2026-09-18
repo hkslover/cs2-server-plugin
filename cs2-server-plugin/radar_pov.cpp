@@ -1,13 +1,10 @@
 #include "radar_pov.h"
-#include "mem_utils.h"
 #include "radar_pov/radar_resolver.h"
 
 #include <atomic>
 #include <cstdarg>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -16,20 +13,36 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <cstdint>
+#include <vector>
 #include <Windows.h>
 #include <MinHook.h>
+#include "mem_utils.h"
 using namespace MemUtils;
 #endif
 
 namespace {
 
 // =============================================================================
-// Design (Ghidra-backed): identity rewrite + teammate type + force ARGB
+// Design (RE-backed, validated against PE 0x6AA1AE5E): identity rewrite +
+// teammate type + force ARGB.
 //
-// Hooks (7):
-//   radar_update, getLocal, GetEntityBySlot, demo/HLTV, findPlayerBySlot,
-//   SetRadarIconType (teammate 0x11→9/0xD), RadarIconColor (force cl_teammate_color_*)
-// Colour-gate hooks (863200 / 8494d0) removed — force-color covers them.
+// THE demo switch: engine vtable +0x2B0 = IVEngineClient::IsHLTV()
+// (mov rcx,[global]; call [vtable+0x2B0]) — consumed at ~21 radar-path sites
+// (radar_mode, setRadarIconType, iconColor, ...). Scoped to 0 it flips the
+// whole radar into the live branch.
+//
+// Hooks (8):
+//   radar_update, getLocal, GetEntityBySlot, demo/HLTV (IsHLTV),
+//   findPlayerBySlot, IsSlotEnemyOf (restore live team gate; demo-session
+//   cvar 0x182339278 reads non-zero and gates teammates into spotted-only),
+//   SetRadarIconType (teammate 0x11→9/0xD + comp-allowed bit),
+//   RadarIconColor (force cl_teammate_color_*)
+// Colour-gate hooks removed — force-color covers them.
+//
+// POV activation: observer chain (getObs(local)) first; if that fails but
+// getLocal() itself is a live T/CT player pawn, use it directly (newer demo
+// playback exposes the POV player as the local pawn with no observer chain).
 //
 // PE/pattern helpers live in mem_utils.h (MemUtils) for reuse by other features.
 // =============================================================================
@@ -66,12 +79,16 @@ std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
 std::atomic<int> g_logPovFail{0};
+std::atomic<int> g_logPovDirect{0};
 std::atomic<int> g_logSpectatorFilter{0};
 std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logGetEntityBySlot{0};
 std::atomic<int> g_logIconType{0};
+std::atomic<int> g_logIconTypeNative{0};
 std::atomic<int> g_logForceColor{0};
 std::atomic<int> g_logForceColorSkip{0};
+std::atomic<int> g_logSlotEnemy{0};
+std::atomic<int> g_logIconState{0};
 
 void Log(const char* fmt, ...)
 {
@@ -100,13 +117,19 @@ using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
 using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 // Controller-by-slot; icon colour path hardcodes GetEntityBySlot(0) as "local".
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
-// FUN_180e39320(icon, playerTeam) — writes icon type at +0x16c.
+// FUN_1808b0e00(localPawn, slot) — per-slot draw gate ("is this player an enemy
+// of local"). Its cvar path (0x182339278 != 0 during demo playback) returns true
+// for every non-self slot and hides unspotted teammates.
+// MSVC x64: __fastcall is accepted but ignored (single x64 ABI), so the
+// function pointer type omits it; identical to the engine-side call signature.
+using IsSlotEnemyOfFn = uint8_t(*)(void* localPawn, int slot);
+// FUN_180e55e00(icon, playerTeam) — writes icon type at +0x16c.
 using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
-// FUN_180e460e0(radar, icon) — icon colour update.
+// FUN_180e62bc0(radar, icon) — icon colour update.
 using RadarIconColorFn = void(__fastcall*)(void* radar, void* icon);
-// FUN_180849370(outArgb, colorIndex) — cl_teammate_color_N ARGB.
+// FUN_180861bb0(outArgb, colorIndex) — cl_teammate_color_N ARGB.
 using GetCompColorArgbFn = uint32_t*(__fastcall*)(uint32_t* outArgb, int colorIndex);
-// FUN_180a732c0(playerIndex) — resolve entity/controller for icon subject.
+// FUN_180a8c160(playerIndex) — resolve entity/controller for icon subject.
 using ResolvePlayerByIndexFn = void*(__fastcall*)(int playerIndex);
 
 RadarUpdateFn g_origRadarUpdate = nullptr;
@@ -116,6 +139,7 @@ GetObserverTargetFn g_getObserverTarget = nullptr;
 GetPlayerSlotFn g_getPlayerSlot = nullptr;
 FindPlayerBySlotFn g_origFindPlayerBySlot = nullptr;
 GetEntityBySlotFn g_origGetEntityBySlot = nullptr;
+IsSlotEnemyOfFn g_origIsSlotEnemyOf = nullptr;
 SetRadarIconTypeFn g_origSetRadarIconType = nullptr;
 RadarIconColorFn g_origRadarIconColor = nullptr;
 GetCompColorArgbFn g_getCompColorArgb = nullptr;
@@ -125,6 +149,7 @@ bool g_minhookInitialized = false;
 bool g_minhookOwned = false;
 bool g_spectatorFilterHooked = false;
 bool g_getEntityBySlotHooked = false;
+bool g_slotEnemyHooked = false;
 bool g_iconTypeHooked = false;
 bool g_iconColorHooked = false;
 uintptr_t g_radarDemoStateGlobalSlot = 0;
@@ -143,6 +168,11 @@ constexpr ptrdiff_t kRadarFromUpdateContext = -0x20;
 constexpr ptrdiff_t kIconTypeOffset = 0x16c;
 constexpr ptrdiff_t kIconPlayerIndexOffset = 0x158;
 constexpr ptrdiff_t kIconColorTimeOffset = 0x14c;
+// Engine "teammate may show competitive colours" bit (0x180e4f729, cvar==0
+// same-team path). The rewrite path sets it because the engine skips it when
+// the demo-session cvar reads non-zero.
+constexpr ptrdiff_t kIconCompAllowedOffset = 0x17d;
+constexpr uint8_t kIconCompAllowedBit = 0x8;
 constexpr ptrdiff_t kControllerTeamOffset = 0x3E7;
 constexpr ptrdiff_t kCompTeammateColorOffset = 0x850;
 constexpr size_t kPanelGetStyleVOff = 0x230;
@@ -289,7 +319,7 @@ bool ApplyQueuedHookEnables()
         return false;
     }
 
-    Log("Radar POV: applied queued hook enables (%zu/7 hooks)", g_createdRadarHooks.size());
+    Log("Radar POV: applied queued hook enables (%zu/8 hooks)", g_createdRadarHooks.size());
     return true;
 }
 
@@ -325,11 +355,12 @@ bool ValidateRequiredHookTargets(const ModuleInfo& client, void* demoStateTarget
     requireHookTarget("radar_demo_state", demoStateTarget, false);
     requireHookTarget("getEntityBySlot", reinterpret_cast<void*>(g_origGetEntityBySlot), true);
     requireHookTarget("findPlayerBySlot", reinterpret_cast<void*>(g_origFindPlayerBySlot), true);
+    requireHookTarget("isSlotEnemyOf", reinterpret_cast<void*>(g_origIsSlotEnemyOf), true);
     requireHookTarget("setRadarIconType", reinterpret_cast<void*>(g_origSetRadarIconType), true);
     requireHookTarget("radarIconColor", reinterpret_cast<void*>(g_origRadarIconColor), true);
 
-    if (resolvedHooks != 7) {
-        Log("Radar POV: hook target resolution incomplete: %zu/7 hooks available", resolvedHooks);
+    if (resolvedHooks != 8) {
+        Log("Radar POV: hook target resolution incomplete: %zu/8 hooks available", resolvedHooks);
         return false;
     }
 
@@ -354,7 +385,7 @@ bool ValidateRequiredHookTargets(const ModuleInfo& client, void* demoStateTarget
         return false;
     }
 
-    Log("Radar POV: resolved 7/7 required hook targets and helpers");
+    Log("Radar POV: resolved 8/8 required hook targets and helpers");
     return true;
 }
 
@@ -554,10 +585,38 @@ void PreparePovContext()
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         realPawn = nullptr;
     }
+    if (realPawn == nullptr) {
+        if (g_logPovFail.fetch_add(1) == 0) {
+            Log("Radar POV: getLocal returned no pawn — show-all ON (fail-safe)");
+        }
+        return;
+    }
+
     void* povPawn = ResolvePovSelfPawn(realPawn);
+    bool directLocal = false;
+    if (povPawn == nullptr) {
+        // Some demo playback builds expose the recorded POV player as the
+        // local pawn directly (getLocal returns the live pawn with no observer
+        // chain). Fall back to the local pawn itself when it is a live player
+        // pawn on team T/CT — the radar then renders that player's live
+        // first-person view instead of silently degrading to show-all.
+        const int localTeam = ReadEntityTeam(realPawn);
+        if (IsPlayerPawn(realPawn) &&
+            (localTeam == kTeamT || localTeam == kTeamCT)) {
+            povPawn = realPawn;
+            directLocal = true;
+            if (g_logPovDirect.fetch_add(1) == 0) {
+                Log("Radar POV: local pawn is the POV player (team %d) — using it directly",
+                    localTeam);
+            }
+        }
+    }
     if (povPawn == nullptr) {
         if (g_logPovFail.fetch_add(1) == 0) {
-            Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p", realPawn);
+            Log("Radar POV: no observer target yet — show-all ON (fail-safe) local=%p team=%d "
+                "playerPawn=%d observing=%d",
+                realPawn, ReadEntityTeam(realPawn), IsPlayerPawn(realPawn) ? 1 : 0,
+                LooksObserving(realPawn) ? 1 : 0);
         }
         return;
     }
@@ -583,9 +642,9 @@ void PreparePovContext()
     }
     RefreshPovSelfTeam();
     if (g_logPovOk.fetch_add(1) == 0) {
-        Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)",
+        Log("Radar POV: active — pawn %p -> observed %p (slot %d team %d, spectatorSlot %d)%s",
             realPawn, povPawn, g_povFrame.selfSlot, g_povFrame.selfTeam,
-            g_povFrame.spectatorSlot);
+            g_povFrame.spectatorSlot, directLocal ? " [direct]" : "");
     }
 }
 
@@ -696,25 +755,92 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
     return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
 }
 
-// FUN_180e39320: with live identity, same-team non-self icons become type 0x11.
-// FUN_180e460e0 live RGB only paints types 9 / 0xD. Map 0x11 → team panel type
+// FUN_1808b0e00(localPawn, playerIndex) — per-slot draw gate ("is this player
+// an enemy of local"). The engine's live branch compares the player's team
+// against the local player's team; but its team-colour cvar path (0x182339278,
+// reads non-zero during demo playback) returns true for every non-self entry,
+// which gates teammates behind the spotted bit and hides the unspotted ones.
+//
+// The second argument is the players loop's converted player index
+// (0x180a8baa0 result), not the raw slot — resolve it exactly like the native
+// gate does (ResolvePlayerByIndex), with a slot lookup as a validated fallback.
+uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int playerIndex)
+{
+    if (IsPovFrameActive()) {
+        __try {
+            int selfTeam = g_povFrame.selfTeam;
+            if (selfTeam != kTeamT && selfTeam != kTeamCT) {
+                selfTeam = RefreshPovSelfTeam();
+            }
+            if (selfTeam == kTeamT || selfTeam == kTeamCT) {
+                void* player = g_resolvePlayerByIndex != nullptr
+                    ? g_resolvePlayerByIndex(playerIndex)
+                    : nullptr;
+                int playerTeam = ReadEntityTeam(player);
+                if (playerTeam != kTeamT && playerTeam != kTeamCT &&
+                    g_origFindPlayerBySlot != nullptr) {
+                    void* bySlot = g_origFindPlayerBySlot(playerIndex);
+                    const int slotTeam = ReadEntityTeam(bySlot);
+                    if (slotTeam == kTeamT || slotTeam == kTeamCT) {
+                        player = bySlot;
+                        playerTeam = slotTeam;
+                    }
+                }
+                if (playerTeam == kTeamT || playerTeam == kTeamCT) {
+                    const int gate = (playerTeam != selfTeam) ? 1 : 0;
+                    const int n = g_logSlotEnemy.fetch_add(1);
+                    if (n < 3) {
+                        Log("Radar POV: gate idx=%d team=%d self=%d -> %d", playerIndex,
+                            playerTeam, selfTeam, gate);
+                    }
+                    return static_cast<uint8_t>(gate);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // fall through to the native gate
+        }
+    }
+    return g_origIsSlotEnemyOf != nullptr ? g_origIsSlotEnemyOf(localPawn, playerIndex) : 0;
+}
+
+// FUN_180e55e00: with live identity, same-team non-self icons become type 0x11
+// when the engine's team-colour path chooses solid team panels.
+// FUN_180e62bc0 live RGB only paints types 9 / 0xD. Map 0x11 → team panel type
 // for POV teammates only (never rewrite enemy icons).
+//
+// New-build fact (radare2): the visible sub-panel is indexed by the type bit
+// (per-frame updater 0xE57E20 builds visibility flags `1 << type`), so rewriting
+// the type byte alone switches the rendered body to the competitive-colour panel.
 void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
 {
     if (g_origSetRadarIconType != nullptr) {
         g_origSetRadarIconType(icon, playerTeam);
     }
-    if (!IsPovFrameActive() || icon == nullptr || !IsPovTeammateTeam(playerTeam)) {
+    if (!IsPovFrameActive() || icon == nullptr) {
         return;
     }
     __try {
         auto* typePtr =
             reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(icon) + kIconTypeOffset);
-        if (*typePtr != kIconTypeLiveTeammate) {
+        const int nativeType = *typePtr;
+        const bool teammate = IsPovTeammateTeam(playerTeam);
+        // Diagnostic: reveal the engine's per-icon type decision (first 3 icons).
+        const int n = g_logIconTypeNative.fetch_add(1);
+        if (n < 3) {
+            Log("Radar POV: icon-type native=%d team=%d selfTeam=%d teammate=%d",
+                nativeType, playerTeam, g_povFrame.selfTeam, teammate ? 1 : 0);
+        }
+        if (nativeType != kIconTypeLiveTeammate || !teammate) {
             return;
         }
         const int fixed = (playerTeam == kTeamT) ? kIconTypeT : kIconTypeCT;
         *typePtr = fixed;
+        // Mirror the engine's cvar==0 teammate path: set the "competitive colours
+        // allowed" bit that the players loop skips when the demo-session cvar
+        // reads non-zero (0x180e4f729).
+        auto* flags17d = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(icon) +
+                                                    kIconCompAllowedOffset);
+        *flags17d = static_cast<uint8_t>(*flags17d | kIconCompAllowedBit);
         if (g_logIconType.fetch_add(1) == 0) {
             Log("Radar POV: icon type 0x11 -> %d (teammate team %d, self team %d)", fixed,
                 playerTeam, g_povFrame.selfTeam);
@@ -843,7 +969,7 @@ void ForceCompetitiveIconColor(void* icon)
         }
 
         const int n = g_logForceColor.fetch_add(1);
-        if (n == 0 || n == 10 || n == 50) {
+        if (n == 0 || n == 120) {
             Log("Radar POV: force-color teammate type=%d team=%d selfTeam=%d netvar=%d idx=%d "
                 "argb=0x%08X panels=%d playerIndex=%d",
                 type, playerTeam, g_povFrame.selfTeam, rawNetvar, colorIdx, argb, painted,
@@ -865,6 +991,34 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
                 -1.0e6f;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             // ignore
+        }
+        // Diagnostic: icon draw state, so a hidden teammate can be traced to the
+        // type/visibility flags or the m_bPawnIsAlive (+0x91C) netvar (first 2 icons).
+        const int n = g_logIconState.fetch_add(1);
+        if (n < 2) {
+            __try {
+                auto* base = reinterpret_cast<uint8_t*>(icon);
+                const int type = *reinterpret_cast<int*>(base + kIconTypeOffset);
+                const int idx = *reinterpret_cast<int*>(base + kIconPlayerIndexOffset);
+                const unsigned flags17c = base[0x17c];
+                const unsigned flags17d = base[0x17d];
+                const uint32_t vis = *reinterpret_cast<uint32_t*>(base + 0x150);
+                int alive = -1;
+                int life = -1;
+                if (g_resolvePlayerByIndex != nullptr) {
+                    void* pl = g_resolvePlayerByIndex(idx);
+                    if (pl != nullptr) {
+                        auto* pb = reinterpret_cast<uint8_t*>(pl);
+                        alive = pb[0x91c];
+                        life = *reinterpret_cast<int*>(pb + 0x6ec);
+                    }
+                }
+                Log("Radar POV: icon idx=%d type=%d vis=0x%X f17c=0x%02X f17d=0x%02X "
+                    "alive=%d life=%d",
+                    idx, type, vis, flags17c, flags17d, alive, life);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // ignore
+            }
         }
     }
 
@@ -894,6 +1048,7 @@ bool ResolveRadarFunctions(const ModuleInfo& client)
     g_getPlayerSlot = resolved.functions.getPlayerSlot;
     g_origFindPlayerBySlot = resolved.functions.findPlayerBySlot;
     g_origGetEntityBySlot = resolved.functions.getEntityBySlot;
+    g_origIsSlotEnemyOf = resolved.functions.isSlotEnemyOf;
     g_origSetRadarIconType = resolved.functions.setRadarIconType;
     g_origRadarIconColor = resolved.functions.radarIconColor;
     g_getCompColorArgb = resolved.functions.getCompColorArgb;
@@ -912,12 +1067,14 @@ void ResetResolvedRadarState()
     g_getPlayerSlot = nullptr;
     g_origFindPlayerBySlot = nullptr;
     g_origGetEntityBySlot = nullptr;
+    g_origIsSlotEnemyOf = nullptr;
     g_origSetRadarIconType = nullptr;
     g_origRadarIconColor = nullptr;
     g_getCompColorArgb = nullptr;
     g_resolvePlayerByIndex = nullptr;
     g_spectatorFilterHooked = false;
     g_getEntityBySlotHooked = false;
+    g_slotEnemyHooked = false;
     g_iconTypeHooked = false;
     g_iconColorHooked = false;
     g_radarDemoStateGlobalSlot = 0;
@@ -996,6 +1153,7 @@ bool InstallHooks()
     void* demoStateTargetForHook = demoStateTarget;
     void* getEntityBySlotTarget = reinterpret_cast<void*>(g_origGetEntityBySlot);
     void* findPlayerBySlotTarget = reinterpret_cast<void*>(g_origFindPlayerBySlot);
+    void* isSlotEnemyOfTarget = reinterpret_cast<void*>(g_origIsSlotEnemyOf);
     void* setRadarIconTypeTarget = reinterpret_cast<void*>(g_origSetRadarIconType);
     void* radarIconColorTarget = reinterpret_cast<void*>(g_origRadarIconColor);
 
@@ -1034,6 +1192,15 @@ bool InstallHooks()
         return false;
     }
 
+    // Required: demo-session cvar makes the native gate treat teammates as
+    // enemies; restore the live team-comparison branch during POV frames.
+    if (!CreateHook(isSlotEnemyOfTarget, reinterpret_cast<void*>(&Hook_IsSlotEnemyOf),
+                    reinterpret_cast<void**>(&g_origIsSlotEnemyOf), "isSlotEnemyOf")) {
+        Log("Radar POV: required hook failed: isSlotEnemyOf");
+        AbortInstall();
+        return false;
+    }
+
     // Icon type: live-teammate 0x11 → 9/0xD for native competitive RGB paint.
     if (!CreateHook(setRadarIconTypeTarget, reinterpret_cast<void*>(&Hook_SetRadarIconType),
                     reinterpret_cast<void**>(&g_origSetRadarIconType), "setRadarIconType")) {
@@ -1066,16 +1233,17 @@ bool InstallHooks()
 
     g_getEntityBySlotHooked = true;
     g_spectatorFilterHooked = true;
+    g_slotEnemyHooked = true;
     g_iconTypeHooked = true;
     g_iconColorHooked = true;
 
     const int activeHooks =
         (g_origRadarUpdate != nullptr ? 1 : 0) + (g_origGetLocal != nullptr ? 1 : 0) +
         (g_origRadarDemoState != nullptr ? 1 : 0) + (g_getEntityBySlotHooked ? 1 : 0) +
-        (g_spectatorFilterHooked ? 1 : 0) + (g_iconTypeHooked ? 1 : 0) +
-        (g_iconColorHooked ? 1 : 0);
-    if (activeHooks != 7 || g_createdRadarHooks.size() != 7) {
-        Log("Radar POV: hook activation incomplete: %d/7 hooks active, %zu/7 targets tracked; "
+        (g_spectatorFilterHooked ? 1 : 0) + (g_slotEnemyHooked ? 1 : 0) +
+        (g_iconTypeHooked ? 1 : 0) + (g_iconColorHooked ? 1 : 0);
+    if (activeHooks != 8 || g_createdRadarHooks.size() != 8) {
+        Log("Radar POV: hook activation incomplete: %d/8 hooks active, %zu/8 targets tracked; "
             "install aborted",
             activeHooks, g_createdRadarHooks.size());
         AbortInstall();
@@ -1083,12 +1251,13 @@ bool InstallHooks()
     }
 
     g_installed.store(true, std::memory_order_release);
-    Log("Radar POV: installed 7/7 hooks active enabled=%d update=%d getLocal=%d getObs=%d demoState=%d "
-        "getEntityBySlot=%d spectatorFilter=%d iconType=%d forceColor=%d",
+    Log("Radar POV: installed 8/8 hooks active enabled=%d update=%d getLocal=%d getObs=%d demoState=%d "
+        "getEntityBySlot=%d spectatorFilter=%d slotEnemy=%d iconType=%d forceColor=%d",
         g_enabled.load() ? 1 : 0, g_origRadarUpdate != nullptr ? 1 : 0,
         g_origGetLocal != nullptr ? 1 : 0, g_getObserverTarget != nullptr ? 1 : 0,
         g_origRadarDemoState != nullptr ? 1 : 0, g_getEntityBySlotHooked ? 1 : 0,
-        g_spectatorFilterHooked ? 1 : 0, g_iconTypeHooked ? 1 : 0, g_iconColorHooked ? 1 : 0);
+        g_spectatorFilterHooked ? 1 : 0, g_slotEnemyHooked ? 1 : 0, g_iconTypeHooked ? 1 : 0,
+        g_iconColorHooked ? 1 : 0);
     return true;
 }
 
