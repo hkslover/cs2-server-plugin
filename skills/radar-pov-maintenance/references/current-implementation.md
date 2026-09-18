@@ -1,7 +1,11 @@
 # Radar POV: validated implementation reference
 
-Last validated design: **7 MinHook detours**, teammate-only competitive colours,
+Last validated design: **8 MinHook detours**, teammate-only competitive colours,
 no forced radar cvars. Revalidate after every CS2 `client.dll` update.
+
+Validated in-game on PE `0x6AA1AE5E` (2026-09-18): demo POV shows teammates in
+competitive colours, enemies only when spotted, no freecam dot. Runtime sample
+in the "Healthy log" section below.
 
 Code: `cs2-server-plugin/radar_pov.cpp`, `radar_pov.h`  
 Related install: `main.cpp` (`RadarPov_Install` on `ClientFullyConnect`;
@@ -61,8 +65,32 @@ extractable) reads **non-zero during demo playback**. It has three effects:
    set by the rewrite hook.
 
 The **IsSlotEnemyOf hook** restores the live branch during POV frames:
-`(team(slot player) != selfTeam)` via the original findPlayerBySlot, so
-teammates always draw and enemies stay spotted-gated.
+`(team(player) != selfTeam)`, so teammates always draw and enemies stay
+spotted-gated.
+
+**Argument space (important):** the players loop does *not* pass the raw slot —
+it passes the converted player index from `0x180a8baa0` (the
+`ResolvePlayerByIndex` space, produced via `0x180917ea0`). The hook must
+resolve with `ResolvePlayerByIndex` (`0xA8C160`) exactly like the native gate
+does; calling `findPlayerBySlot` on that value returns null, which silently
+falls back to the native teammate-hiding path (this was the "teammates missing"
+bug). A team-validated `findPlayerBySlot` fallback is kept.
+
+### Second hiding mechanism: m_bPawnIsAlive (icon state flags)
+
+Players loop (`0xE4EF90`) per icon:
+
+| Condition | Effect |
+| --- | --- |
+| `[player+0x6EC]` ∉ {0,3} | dead/dying path `0xE4F867` — position/fade only, no gate, no colour |
+| `m_bPawnIsAlive` (`[player+0x91C]`) == 0 | sets icon `+0x17C` bit `0x20` (hidden), skips drawing |
+| `+0x17C` bit `0x20` set while alive | clears it, skips one frame, then draws |
+| otherwise | draw gate `IsSlotEnemyOf` → teammates draw, enemies spotted-gated |
+
+`m_bPawnIsAlive` at `+0x91C` was confirmed from the client schema table
+(`lea rdx, str.m_bPawnIsAlive` + offset `0x91C` at `0x1808683E3`). Dead
+teammates legitimately do not draw (live behaviour) — check the alive state
+before diagnosing a "missing teammates" report.
 
 ### Why identity alone is not enough
 
@@ -148,6 +176,11 @@ offsets are identical to the previous build. Only code RVAs moved.
 | ResolvePlayerByIndex | `0xA8C160` | `mov ecx,[rsi+0x158]; call` in icon colour |
 | getPlayerSlot | `0x918130` | `lea rdx,[rsp+24]; mov rcx,rax; call` in players |
 | findPlayerBySlot | `0xA8BDC0` | `mov ecx,edi; call` in players |
+| IsSlotEnemyOf (draw gate) | `0x8B0E00` | in players: `mov edx,[rsp+28]; mov rcx,[rsp+38]; call` |
+| m_bPawnIsAlive (bool) | controller `+0x91C` | Schema entry at `0x1808683E3` (`str.m_bPawnIsAlive`) |
+| Life-state-ish int | controller `+0x6EC` | players-loop alive/dead path select (`{0,3}` = alive path) |
+| Icon hidden bit | `icon+0x17C` bit `0x20` | set when `m_bPawnIsAlive == 0` |
+| Icon visibility flags | `icon+0x150` | `1 << type` selects the drawn sub-panel (`0xE57E20`) |
 | m_iTeamNum | entity `+0x3E7` | Byte (2=CT, 3=T); confirmed on pawn AND controller |
 | m_iCompTeammateColor | controller `+0x850` | Int 0–4 or unset |
 | Observer services | pawn `+0x1220` | Unchanged |
@@ -217,9 +250,20 @@ Radar POV: filtering demo spectator slot 0
 Radar POV: GetEntityBySlot 0 -> observed slot N
 Radar POV: icon-type native=17 team=2|3 selfTeam=... teammate=...   (first 12 icons)
 Radar POV: icon type 0x11 -> 9|13 (teammate team 2|3, self team 2|3)
-Radar POV: slot N gate team=2|3 self=2|3 -> 0                       (teammate not gated)
-Radar POV: force-color teammate type=9|13 team=T selfTeam=T netvar=... idx=... argb=0x... panels=6 playerIndex=...
+Radar POV: gate idx=185 team=2 self=2 -> 0        (teammate not gated)
+Radar POV: gate idx=183 team=3 self=2 -> 1        (enemy gated → spotted-only)
+Radar POV: icon idx=5 type=13 vis=0x0 f17c=0x01 f17d=0x01 alive=1 life=0
+Radar POV: force-color teammate type=13 team=2 selfTeam=2 netvar=4 idx=4 argb=0xFF962CBD panels=6 playerIndex=5
 ```
+
+Reading notes:
+
+- `gate ... -> 0` when `team == self`, `-> 1` for the other team — that is the
+  live branch; teammates must never log `-> 1`.
+- `vis=0x0` at colour time is expected — the per-frame visibility updater
+  (`0xE57E20`, flags `1 << type`) runs later in the same frame.
+- `alive` is `m_bPawnIsAlive` (`+0x91C`), `life` is `[+0x6EC]`; `alive=0` means
+  the icon is correctly hidden (dead player).
 
 Direct-local variant (newer demo playback; `spectatorSlot -1`, pawn == observed):
 
@@ -248,6 +292,7 @@ Must **not** appear:
 | Allies solid team colour, no force-color lines | Hook not running or type filter excluding all |
 | Enemies multi-coloured | `IsPovTeammateTeam` too loose |
 | Extra freecam dot | `findPlayerBySlot` / wrong `g_spectatorSlot` |
+| Teammates missing on demo radar | Check `alive`/`life` in the icon diagnostic first (dead teammates do not draw). If alive: no `gate` lines → isSlotEnemyOf arg resolution broke (must use `ResolvePlayerByIndex`); a teammate logging `gate ... -> 1` → team/selfTeam wrong |
 | Install shape errors | Outer update / mode prologue masks |
 | Feature completely inactive in demo | `PreparePovContext` observer chain fails AND direct-local fallback conditions not met — capture `no observer target yet` log line details |
 

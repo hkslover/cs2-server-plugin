@@ -11,7 +11,7 @@ colours (not solid team orange/blue for allies), native enemy spotting, and no
 freecam spectator blob.
 
 Read **`references/current-implementation.md`** first. It is the source of truth
-for the validated 7-hook design, Ghidra anchors, and healthy-log contract.
+for the validated 8-hook design, RE anchors, and healthy-log contract.
 
 ## Goal (validated contract)
 
@@ -47,11 +47,19 @@ Demo and live share **one** radar update chain. Branches re-query independently:
 
 1. **Who is local (pawn)** — `getLocal`
 2. **Who is local (controller)** — `GetEntityBySlot(0)` (colour path; **not** getLocal)
-3. **Is demo/HLTV** — engine vtable `+0x2B0` (scoped false during POV)
+3. **Is demo/HLTV** — engine vtable `+0x2B0` (`IVEngineClient::IsHLTV`; scoped
+   false during POV)
 4. **Icon type** — live teammates become type `0x11`; competitive RGB in
-   `FUN_180e460e0` only paints types `9` / `0xD`
-5. **Actual ARGB** — demo netvars/gates often no-op; validated path **force-paints**
-   after native `e460e0` using engine palette helpers
+   `FUN_180e62bc0` only paints types `9` / `0xD`. The drawn sub-panel is indexed
+   by the type bit (`1 << type`), so the visible body follows the type
+5. **Who may draw** — `IsSlotEnemyOf` (`0x8B0E00`): a demo-session cvar
+   (`0x182339278`) path returns true for every non-self player and hides
+   unspotted teammates. Hooked back to the live team comparison. Note its
+   argument is the converted player index (`ResolvePlayerByIndex` space)
+6. **Icon hidden/alive state** — `m_bPawnIsAlive` (`+0x91C`) drives icon `+0x17C`
+   bit `0x20`; dead players legitimately do not draw
+7. **Actual ARGB** — demo netvars/gates often no-op; validated path **force-paints**
+   after native `180e62bc0` using engine palette helpers
 
 Identity rewrite alone opens the live branch but leaves type `0x11` → solid team
 panels. Colour-gate-only hooks without force-paint were insufficient in demos.
