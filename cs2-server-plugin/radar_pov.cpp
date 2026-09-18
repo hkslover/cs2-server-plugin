@@ -88,6 +88,7 @@ std::atomic<int> g_logIconTypeNative{0};
 std::atomic<int> g_logForceColor{0};
 std::atomic<int> g_logForceColorSkip{0};
 std::atomic<int> g_logSlotEnemy{0};
+std::atomic<int> g_logIconState{0};
 
 void Log(const char* fmt, ...)
 {
@@ -754,29 +755,42 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
     return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
 }
 
-// FUN_1808b0e00(localPawn, slot) — per-slot draw gate ("is this player an enemy
-// of local"). The engine's live branch compares the slot player's team against
-// the local player's team; but its team-colour cvar path (0x182339278, reads
-// non-zero during demo playback) returns true for every non-self slot, which
-// gates teammates behind the spotted bit and hides the unspotted ones.
-// During POV frames reproduce the live branch: gate only players on a team
-// different from the observed player's.
-uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int slot)
+// FUN_1808b0e00(localPawn, playerIndex) — per-slot draw gate ("is this player
+// an enemy of local"). The engine's live branch compares the player's team
+// against the local player's team; but its team-colour cvar path (0x182339278,
+// reads non-zero during demo playback) returns true for every non-self entry,
+// which gates teammates behind the spotted bit and hides the unspotted ones.
+//
+// The second argument is the players loop's converted player index
+// (0x180a8baa0 result), not the raw slot — resolve it exactly like the native
+// gate does (ResolvePlayerByIndex), with a slot lookup as a validated fallback.
+uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int playerIndex)
 {
-    if (IsPovFrameActive() && g_origFindPlayerBySlot != nullptr) {
+    if (IsPovFrameActive()) {
         __try {
-            void* player = g_origFindPlayerBySlot(slot);
-            if (player != nullptr) {
-                int selfTeam = g_povFrame.selfTeam;
-                if (selfTeam != kTeamT && selfTeam != kTeamCT) {
-                    selfTeam = RefreshPovSelfTeam();
+            int selfTeam = g_povFrame.selfTeam;
+            if (selfTeam != kTeamT && selfTeam != kTeamCT) {
+                selfTeam = RefreshPovSelfTeam();
+            }
+            if (selfTeam == kTeamT || selfTeam == kTeamCT) {
+                void* player = g_resolvePlayerByIndex != nullptr
+                    ? g_resolvePlayerByIndex(playerIndex)
+                    : nullptr;
+                int playerTeam = ReadEntityTeam(player);
+                if (playerTeam != kTeamT && playerTeam != kTeamCT &&
+                    g_origFindPlayerBySlot != nullptr) {
+                    void* bySlot = g_origFindPlayerBySlot(playerIndex);
+                    const int slotTeam = ReadEntityTeam(bySlot);
+                    if (slotTeam == kTeamT || slotTeam == kTeamCT) {
+                        player = bySlot;
+                        playerTeam = slotTeam;
+                    }
                 }
-                const int playerTeam = ReadEntityTeam(player);
-                if (selfTeam == kTeamT || selfTeam == kTeamCT) {
+                if (playerTeam == kTeamT || playerTeam == kTeamCT) {
                     const int gate = (playerTeam != selfTeam) ? 1 : 0;
                     const int n = g_logSlotEnemy.fetch_add(1);
-                    if (n == 0) {
-                        Log("Radar POV: slot %d gate team=%d self=%d -> %d", slot,
+                    if (n < 8) {
+                        Log("Radar POV: gate idx=%d team=%d self=%d -> %d", playerIndex,
                             playerTeam, selfTeam, gate);
                     }
                     return static_cast<uint8_t>(gate);
@@ -786,7 +800,7 @@ uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int slot)
             // fall through to the native gate
         }
     }
-    return g_origIsSlotEnemyOf != nullptr ? g_origIsSlotEnemyOf(localPawn, slot) : 0;
+    return g_origIsSlotEnemyOf != nullptr ? g_origIsSlotEnemyOf(localPawn, playerIndex) : 0;
 }
 
 // FUN_180e55e00: with live identity, same-team non-self icons become type 0x11
@@ -977,6 +991,34 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
                 -1.0e6f;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             // ignore
+        }
+        // Diagnostic: icon draw state, so a hidden teammate can be traced to the
+        // type/visibility flags or the m_bPawnIsAlive (+0x91C) netvar.
+        const int n = g_logIconState.fetch_add(1);
+        if (n < 16) {
+            __try {
+                auto* base = reinterpret_cast<uint8_t*>(icon);
+                const int type = *reinterpret_cast<int*>(base + kIconTypeOffset);
+                const int idx = *reinterpret_cast<int*>(base + kIconPlayerIndexOffset);
+                const unsigned flags17c = base[0x17c];
+                const unsigned flags17d = base[0x17d];
+                const uint32_t vis = *reinterpret_cast<uint32_t*>(base + 0x150);
+                int alive = -1;
+                int life = -1;
+                if (g_resolvePlayerByIndex != nullptr) {
+                    void* pl = g_resolvePlayerByIndex(idx);
+                    if (pl != nullptr) {
+                        auto* pb = reinterpret_cast<uint8_t*>(pl);
+                        alive = pb[0x91c];
+                        life = *reinterpret_cast<int*>(pb + 0x6ec);
+                    }
+                }
+                Log("Radar POV: icon idx=%d type=%d vis=0x%X f17c=0x%02X f17d=0x%02X "
+                    "alive=%d life=%d",
+                    idx, type, vis, flags17c, flags17d, alive, life);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // ignore
+            }
         }
     }
 
