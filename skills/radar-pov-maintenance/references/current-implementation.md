@@ -33,7 +33,9 @@ Hook_RadarUpdate (scope)
   ├─ GetEntityBySlot(0 / -1)    → observed controller slot
   ├─ demo/HLTV (+0x2B0 = IVEngineClient::IsHLTV) → 0 (this frame only)
   ├─ findPlayerBySlot(spec)     → nullptr
+  ├─ IsSlotEnemyOf (0x8B0E00)   → live team gate (see below)
   ├─ SetRadarIconType           → teammates only: type 0x11 → 9 (T) / 0xD (CT)
+  │                               + comp-allowed bit [icon+0x17D] |= 8
   └─ RadarIconColor (e62bc0)
         native update
         then ForceCompetitiveIconColor (teammates only, engine ARGB palette)
@@ -43,6 +45,24 @@ The direct-local fallback triggers only when the observer chain fails to
 resolve a pawn AND `getLocal()` itself is a live player pawn on team T/CT.
 Without it, that build silently degrades to the show-all fail-safe (native
 demo radar) — i.e. the feature appears completely inactive.
+
+### The teammate-hiding cvar (confirmed from runtime log, PE 0x6AA1AE5E)
+
+A runtime-registered ConVar ref (object `0x182339278`, name not statically
+extractable) reads **non-zero during demo playback**. It has three effects:
+
+1. `IsSlotEnemyOf` (0x8B0E00) early-returns true for every non-self slot →
+   the players-loop draw gate hides unspotted **teammates** (enemies behave
+   correctly by accident — they are spotted-gated in live too). The POV
+   player's own icon still shows via the obsTarget==pawn check.
+2. `SetRadarIconType` gives same-team icons type 0x11 (solid dot) instead of
+   9/0xD — handled by the type rewrite.
+3. The players loop skips the `[icon+0x17D] |= 8` "comp colours allowed" bit —
+   set by the rewrite hook.
+
+The **IsSlotEnemyOf hook** restores the live branch during POV frames:
+`(team(slot player) != selfTeam)` via the original findPlayerBySlot, so
+teammates always draw and enemies stay spotted-gated.
 
 ### Why identity alone is not enough
 
@@ -64,7 +84,7 @@ demo radar) — i.e. the feature appears completely inactive.
 | getCompTeammateColor (8494d0) | Force path reads `+0x850` directly |
 | QueueEngineSetup cvars | Empty; host/tool owns cvars |
 
-## Hooks (7)
+## Hooks (8)
 
 | # | Name (log) | Target role (RVA, PE `0x6AA1AE5E`) | Required | Role |
 | --- | --- | --- | --- | --- |
@@ -73,8 +93,9 @@ demo radar) — i.e. the feature appears completely inactive.
 | 3 | `radar_demo_state` | Engine vtable `+0x2B0` (`IsHLTV`) | yes | Scoped non-demo |
 | 4 | `getEntityBySlot` | `0x93F780` | yes | Slot `0`/`-1` → observed controller slot |
 | 5 | `findPlayerBySlot` | `0xA8BDC0` (players-loop call site) | yes (product) | Hide freecam spectator slot |
-| 6 | `setRadarIconType` | `0xE55E00` | yes (current) | Teammate `0x11` → `9`/`0xD` (panel set for colour) |
-| 7 | `radarIconColor` | `0xE62BC0` | yes (current) | After native: force teammate ARGB |
+| 6 | `isSlotEnemyOf` | `0x8B0E00` (players-loop call site) | yes | Live team gate; teammates always drawn |
+| 7 | `setRadarIconType` | `0xE55E00` | yes (current) | Teammate `0x11` → `9`/`0xD` + comp-allowed bit |
+| 8 | `radarIconColor` | `0xE62BC0` | yes (current) | After native: force teammate ARGB |
 
 Helpers (not hooked): `getObs` (`0x82C770`, pawn `+0x1220`), `getPlayerSlot`
 (`0x918130`), `GetCompColorArgb` (`0x861BB0`), `ResolvePlayerByIndex`
@@ -188,12 +209,15 @@ FindPatternAll(base, size, pattern, maxHits);
 ## Healthy log (success baseline)
 
 ```text
-Radar POV: installed enabled=1 update=1 getLocal=1 getObs=1 demoState=1
-  getEntityBySlot=1 spectatorFilter=1 iconType=1 forceColor=1
+Radar POV: installed 8/8 hooks active enabled=1 update=1 getLocal=1 getObs=1 demoState=1
+  getEntityBySlot=1 spectatorFilter=1 slotEnemy=1 iconType=1 forceColor=1
 Radar POV: active — pawn ... -> observed ... (slot N team 2|3, spectatorSlot 0)
 Radar POV: demo/HLTV state 1 -> 0 for radar frame
 Radar POV: filtering demo spectator slot 0
 Radar POV: GetEntityBySlot 0 -> observed slot N
+Radar POV: icon-type native=17 team=2|3 selfTeam=... teammate=...   (first 12 icons)
+Radar POV: icon type 0x11 -> 9|13 (teammate team 2|3, self team 2|3)
+Radar POV: slot N gate team=2|3 self=2|3 -> 0                       (teammate not gated)
 Radar POV: force-color teammate type=9|13 team=T selfTeam=T netvar=... idx=... argb=0x... panels=6 playerIndex=...
 ```
 
