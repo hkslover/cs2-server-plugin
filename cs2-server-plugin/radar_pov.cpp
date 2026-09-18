@@ -82,6 +82,7 @@ std::atomic<int> g_logSpectatorFilter{0};
 std::atomic<int> g_logDemoStateOverride{0};
 std::atomic<int> g_logGetEntityBySlot{0};
 std::atomic<int> g_logIconType{0};
+std::atomic<int> g_logIconTypeNative{0};
 std::atomic<int> g_logForceColor{0};
 std::atomic<int> g_logForceColorSkip{0};
 
@@ -736,21 +737,34 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
     return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
 }
 
-// FUN_180e39320: with live identity, same-team non-self icons become type 0x11.
-// FUN_180e460e0 live RGB only paints types 9 / 0xD. Map 0x11 → team panel type
+// FUN_180e55e00: with live identity, same-team non-self icons become type 0x11
+// when the engine's team-colour path chooses solid team panels.
+// FUN_180e62bc0 live RGB only paints types 9 / 0xD. Map 0x11 → team panel type
 // for POV teammates only (never rewrite enemy icons).
+//
+// New-build fact (radare2): the visible sub-panel is indexed by the type bit
+// (per-frame updater 0xE57E20 builds visibility flags `1 << type`), so rewriting
+// the type byte alone switches the rendered body to the competitive-colour panel.
 void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
 {
     if (g_origSetRadarIconType != nullptr) {
         g_origSetRadarIconType(icon, playerTeam);
     }
-    if (!IsPovFrameActive() || icon == nullptr || !IsPovTeammateTeam(playerTeam)) {
+    if (!IsPovFrameActive() || icon == nullptr) {
         return;
     }
     __try {
         auto* typePtr =
             reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(icon) + kIconTypeOffset);
-        if (*typePtr != kIconTypeLiveTeammate) {
+        const int nativeType = *typePtr;
+        const bool teammate = IsPovTeammateTeam(playerTeam);
+        // Diagnostic: reveal the engine's per-icon type decision (first 12 icons).
+        const int n = g_logIconTypeNative.fetch_add(1);
+        if (n < 12) {
+            Log("Radar POV: icon-type native=%d team=%d selfTeam=%d teammate=%d",
+                nativeType, playerTeam, g_povFrame.selfTeam, teammate ? 1 : 0);
+        }
+        if (nativeType != kIconTypeLiveTeammate || !teammate) {
             return;
         }
         const int fixed = (playerTeam == kTeamT) ? kIconTypeT : kIconTypeCT;
