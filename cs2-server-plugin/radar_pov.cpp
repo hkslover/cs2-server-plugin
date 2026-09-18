@@ -789,7 +789,7 @@ uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int playerIndex)
                 if (playerTeam == kTeamT || playerTeam == kTeamCT) {
                     const int gate = (playerTeam != selfTeam) ? 1 : 0;
                     const int n = g_logSlotEnemy.fetch_add(1);
-                    if (n < 8) {
+                    if (n < 3) {
                         Log("Radar POV: gate idx=%d team=%d self=%d -> %d", playerIndex,
                             playerTeam, selfTeam, gate);
                     }
@@ -824,9 +824,9 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
             reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(icon) + kIconTypeOffset);
         const int nativeType = *typePtr;
         const bool teammate = IsPovTeammateTeam(playerTeam);
-        // Diagnostic: reveal the engine's per-icon type decision (first 12 icons).
+        // Diagnostic: reveal the engine's per-icon type decision (first 3 icons).
         const int n = g_logIconTypeNative.fetch_add(1);
-        if (n < 12) {
+        if (n < 3) {
             Log("Radar POV: icon-type native=%d team=%d selfTeam=%d teammate=%d",
                 nativeType, playerTeam, g_povFrame.selfTeam, teammate ? 1 : 0);
         }
@@ -969,7 +969,7 @@ void ForceCompetitiveIconColor(void* icon)
         }
 
         const int n = g_logForceColor.fetch_add(1);
-        if (n == 0 || n == 10 || n == 50) {
+        if (n == 0 || n == 120) {
             Log("Radar POV: force-color teammate type=%d team=%d selfTeam=%d netvar=%d idx=%d "
                 "argb=0x%08X panels=%d playerIndex=%d",
                 type, playerTeam, g_povFrame.selfTeam, rawNetvar, colorIdx, argb, painted,
@@ -993,9 +993,9 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
             // ignore
         }
         // Diagnostic: icon draw state, so a hidden teammate can be traced to the
-        // type/visibility flags or the m_bPawnIsAlive (+0x91C) netvar.
+        // type/visibility flags or the m_bPawnIsAlive (+0x91C) netvar (first 2 icons).
         const int n = g_logIconState.fetch_add(1);
-        if (n < 16) {
+        if (n < 2) {
             __try {
                 auto* base = reinterpret_cast<uint8_t*>(icon);
                 const int type = *reinterpret_cast<int*>(base + kIconTypeOffset);

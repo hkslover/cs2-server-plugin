@@ -248,7 +248,7 @@ Radar POV: active — pawn ... -> observed ... (slot N team 2|3, spectatorSlot 0
 Radar POV: demo/HLTV state 1 -> 0 for radar frame
 Radar POV: filtering demo spectator slot 0
 Radar POV: GetEntityBySlot 0 -> observed slot N
-Radar POV: icon-type native=17 team=2|3 selfTeam=... teammate=...   (first 12 icons)
+Radar POV: icon-type native=17 team=2|3 selfTeam=... teammate=...   (first 3 icons)
 Radar POV: icon type 0x11 -> 9|13 (teammate team 2|3, self team 2|3)
 Radar POV: gate idx=185 team=2 self=2 -> 0        (teammate not gated)
 Radar POV: gate idx=183 team=3 self=2 -> 1        (enemy gated → spotted-only)
@@ -257,6 +257,10 @@ Radar POV: force-color teammate type=13 team=2 selfTeam=2 netvar=4 idx=4 argb=0x
 ```
 
 Reading notes:
+
+- Diagnostics are capped per session: `icon-type` ≤ 3, `gate` ≤ 3,
+  `icon` state ≤ 2, `force-color` 2 samples (first + a late one); every other
+  line is one-shot. A session produces ~15 radar lines total.
 
 - `gate ... -> 0` when `team == self`, `-> 1` for the other team — that is the
   live branch; teammates must never log `-> 1`.
