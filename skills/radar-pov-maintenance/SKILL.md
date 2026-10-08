@@ -72,6 +72,13 @@ panels. Colour-gate-only hooks without force-paint were insufficient in demos.
 
 ## Reverse engineering
 
+**Offline static validation first:** put the new `client.dll` in `dll/` and run
+`tools/run-radar-resolver-check.sh` — it re-runs the production resolver against
+the file image. PASS means only the hardcoded `radar_pov.cpp` offsets need
+checking (see the schema-string method in `references/current-implementation.md`).
+FAIL pinpoints the broken chain; use `tools/radar_dll_analysis.py`
+(PE map + capstone disasm) or the Ghidra bridge for the failing role.
+
 Prefer Ghidra bridge when the user has it (e.g. `http://127.0.0.1:8080/`). Use
 an endpoint the user provides; do not assume a fixed layout or start a second
 bridge if one is running.
@@ -110,10 +117,11 @@ Prefer instruction relationships + prologue masks over single brittle immediates
 
 ## Validate
 
-1. Build the Windows plugin.
-2. Play a competitive demo, `spec_mode` first-person, radar rotation on.
-3. Check `csdm.log` against **Healthy log** in `references/current-implementation.md`.
-4. Visual: allies multi-colour; enemies default (not competitive palette); no freecam dot.
+1. Run the offline static check (`tools/run-radar-resolver-check.sh`) — must PASS.
+2. Build the Windows plugin.
+3. Play a competitive demo, `spec_mode` first-person, radar rotation on.
+4. Check `csdm.log` against **Healthy log** in `references/current-implementation.md`.
+5. Visual: allies multi-colour; enemies default (not competitive palette); no freecam dot.
 
 ## Keep this skill current
 
