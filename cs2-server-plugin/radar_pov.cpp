@@ -182,6 +182,9 @@ constexpr int kIconTypeT = 9;
 constexpr int kIconTypeCT = 0xd;
 constexpr int kTeamT = 3;
 constexpr int kTeamCT = 2;
+// Consecutive-fault budget before the feature disables itself and the radar
+// falls back to the native demo path instead of freezing mid-update forever.
+constexpr int kMaxRadarUpdateFaults = 3;
 // Same panels FUN_180e460e0 paints for competitive ARGB (T then CT sets).
 constexpr ptrdiff_t kCompColorPanelOffs[] = {0x60, 0x68, 0x70, 0x80, 0x88, 0x90};
 ptrdiff_t g_radarShowAllFlagOffset = 0;
@@ -702,6 +705,28 @@ private:
     uint8_t* radar_ = nullptr;
 };
 
+void RecoverPovFrameAfterFault(void* updateContext)
+{
+    // The SEH unwind above skipped RadarPovFrameScope's destructor (MSVC /EHsc
+    // does not run C++ destructors for asynchronous exceptions), so the POV
+    // frame state leaks: depth stays > 0 ("enabled" reads stale-true) and
+    // the identity substitutions keep applying outside a valid frame. Reset
+    // it here and fall back to the native demo radar (show-all ON) for this
+    // frame; repeated faults disable the feature entirely.
+    g_povFrame.depth = 0;
+    ClearPovContext();
+    if (updateContext != nullptr) {
+        SetShowAllFlag(reinterpret_cast<uint8_t*>(updateContext) + kRadarFromUpdateContext,
+                       true);
+    }
+    if (g_faultRadarUpdate.load() >= kMaxRadarUpdateFaults) {
+        g_enabled.store(false, std::memory_order_release);
+        Log("Radar POV: %d exceptions inside radar_update — feature disabled, "
+            "native demo radar restored",
+            g_faultRadarUpdate.load());
+    }
+}
+
 void CallOriginalRadarUpdate(void* updateContext, uint8_t updateEnabled)
 {
     __try {
@@ -713,6 +738,7 @@ void CallOriginalRadarUpdate(void* updateContext, uint8_t updateEnabled)
             Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08lX) context=%p",
                 GetExceptionCode(), updateContext);
         }
+        RecoverPovFrameAfterFault(updateContext);
     }
 }
 
