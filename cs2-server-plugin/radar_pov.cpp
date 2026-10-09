@@ -75,6 +75,10 @@ inline bool IsPovFrameActive()
 #endif
 
 std::atomic<int> g_faultRadarUpdate{0};
+// Module base of client.dll at install time (single write, read from the SEH
+// filter on the radar-update thread) — used to report fault RVAs.
+uintptr_t g_clientFaultBase = 0;
+size_t g_clientFaultSize = 0;
 std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
@@ -705,6 +709,31 @@ private:
     uint8_t* radar_ = nullptr;
 };
 
+int LogRadarUpdateFault(unsigned int code, EXCEPTION_POINTERS* info)
+{
+    if (g_faultRadarUpdate.fetch_add(1) == 0) {
+        uintptr_t rip = 0;
+        uintptr_t target = 0;
+        if (info != nullptr && info->ExceptionRecord != nullptr) {
+            rip = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+            // Read/write access faults carry the inaccessible address in [1].
+            target = static_cast<uintptr_t>(
+                info->ExceptionRecord->ExceptionInformation[1]);
+        }
+        const bool haveBase = g_clientFaultBase != 0;
+        const bool ripInside = haveBase && rip >= g_clientFaultBase &&
+            rip < g_clientFaultBase + g_clientFaultSize;
+        const bool targetInside = haveBase && target >= g_clientFaultBase &&
+            target < g_clientFaultBase + g_clientFaultSize;
+        Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08X) faultRip=%p "
+            "faultTarget=%p (RVA rip=0x%zX target=0x%zX)",
+            code, reinterpret_cast<void*>(rip), reinterpret_cast<void*>(target),
+            ripInside ? static_cast<size_t>(rip - g_clientFaultBase) : 0,
+            targetInside ? static_cast<size_t>(target - g_clientFaultBase) : 0);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 void RecoverPovFrameAfterFault(void* updateContext)
 {
     // The SEH unwind above skipped RadarPovFrameScope's destructor (MSVC /EHsc
@@ -733,11 +762,7 @@ void CallOriginalRadarUpdate(void* updateContext, uint8_t updateEnabled)
         if (g_origRadarUpdate != nullptr) {
             g_origRadarUpdate(updateContext, updateEnabled);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (g_faultRadarUpdate.fetch_add(1) == 0) {
-            Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08lX) context=%p",
-                GetExceptionCode(), updateContext);
-        }
+    } __except (LogRadarUpdateFault(GetExceptionCode(), GetExceptionInformation())) {
         RecoverPovFrameAfterFault(updateContext);
     }
 }
@@ -1106,6 +1131,8 @@ void ResetResolvedRadarState()
     g_iconTypeHooked = false;
     g_iconColorHooked = false;
     g_radarDemoStateGlobalSlot = 0;
+    g_clientFaultBase = 0;
+    g_clientFaultSize = 0;
     g_radarShowAllFlagOffset = 0;
     g_installed.store(false, std::memory_order_release);
 }
@@ -1141,6 +1168,8 @@ bool InstallHooks()
     }
     Log("Radar POV: client.dll @ %p size=0x%zx PE-timestamp=0x%08X", client.base, client.size,
         GetPeTimestamp(client));
+    g_clientFaultBase = reinterpret_cast<uintptr_t>(client.base);
+    g_clientFaultSize = client.size;
 
     if (!ResolveRadarFunctions(client)) {
         return false;
