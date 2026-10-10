@@ -3,13 +3,12 @@
 Last validated design: **8 MinHook detours**, teammate-only competitive colours,
 no forced radar cvars. Revalidate after every CS2 `client.dll` update.
 
-Validated in-game on PE `0x6AA1AE5E` (2026-09-18): demo POV shows teammates in
-competitive colours, enemies only when spotted, no freecam dot.
+Validated in-game on PE `0x6AC7FFFA` (2026-10-10): demo POV shows teammates in
+competitive colours, enemies only when spotted, no freecam dot; healthy log
+captured below. PE `0x6AC410BA` was adapted in the same change — the two
+builds share identical structural offsets; only code RVAs differ.
 
-**PE `0x6AC410BA` (2026-10-07) adaptation: every resolver step statically
-revalidated offline (PASS, see "Offline static validation"), offsets updated
-in `radar_pov.cpp`/resolver. Windows build + in-game demo validation still
-PENDING — the healthy-log contract below is expected unchanged.
+Earlier validated in-game on PE `0x6AA1AE5E` (2026-09-18).
 
 Code: `cs2-server-plugin/radar_pov.cpp`, `radar_pov.h`  
 Related install: `main.cpp` (`RadarPov_Install` on `ClientFullyConnect`;
@@ -143,7 +142,7 @@ do not draw (live behaviour) — check the alive state before diagnosing a
 
 ## Hooks (8)
 
-| # | Name (log) | Target role (RVA, PE `0x6AC410BA`; historical PE `0x6AA1AE5E`) | Required | Role |
+| # | Name (log) | Target role (RVA, PE `0x6AC410BA`; `0x6AC7FFFA` values in the RVA quick map above; historical PE `0x6AA1AE5E`) | Required | Role |
 | --- | --- | --- | --- | --- |
 | 1 | `radar_update` | Outer update `0xEAB030` (old `0xE408D0`) (vtable `CCSGO_HudRadar` +`0x2E0`) | yes | Thread-local POV scope; show-all fail-safe |
 | 2 | `getLocal` | `0xC7BB90` (old `0xC29DA0`) | yes | Observed **pawn** as self |
@@ -183,13 +182,42 @@ fallback `playerIndex % 5` if unset; `GetCompColorArgb` → SetColor on panels
 - Lazy refresh in `IsPovTeammateTeam` if still invalid.
 - Never competitive-colour enemies.
 
-## Last known-good anchors (PE `0x6AC410BA`, client.dll 2026-10-07)
+## Last known-good anchors (PE `0x6AC7FFFA`, client.dll 2026-10-09 — validated in-game 2026-10-10)
 
-Resolver re-validated statically against this build (2026-10-08, offline
-harness `tools/run-radar-resolver-check.sh` → PASS): every step of
-`ResolveRadarFunctions` resolves uniquely. Structural offsets re-confirmed
-from code + the CCSPlayerController schema table. Only code RVAs moved
-versus PE `0x6AA1AE5E` — plus the changes marked **below**.
+Resolver re-validated statically against this build (2026-10-09, offline
+harness `tools/run-radar-resolver-check.sh` → PASS) **and** validated in-game
+(2026-10-10, healthy log captured). Structural offsets are **identical** to
+PE `0x6AC410BA` — only code RVAs differ. Use the discovery column, not the
+numbers, after the next update.
+
+### PE `0x6AC7FFFA` RVA quick map (image base `0x180000000`)
+
+| Function | RVA |
+| --- | --- |
+| radar_update | `0xEAAB30` |
+| players loop | `0xEBA280` |
+| getLocal | `0xC7B720` |
+| getObs | `0x852CA0` |
+| getPlayerSlot | `0x9415B0` |
+| findPlayerBySlot | `0xAC9D90` |
+| GetEntityBySlot | `0x9699F0` |
+| IsSlotEnemyOf | `0x8D83D0` |
+| SetRadarIconType | `0xEC1230` |
+| RadarIconColor | `0xECEB30` |
+| GetCompColorArgb | `0x888D20` |
+| GetCompTeammateColor (netvar) | `0x888DD0` |
+| team read (cvar override) | `0x8889D0` |
+| ResolvePlayerByIndex | `0xACA130` |
+| IsSpectatorCheck (controller) | `0x89BB20` |
+| obs-target handle resolver | `0x852C20`-class (getObs region) |
+| demo/HLTV state global slot | `0x2557B80` |
+| ConVar object / pointer slot | `0x256FEE8` / obj+`0x8` |
+| show-all flag | `radar+0x17808` bit0 |
+
+### PE `0x6AC410BA` (client.dll 2026-10-07) — offsets identical, RVAs differ
+
+Every step of `ResolveRadarFunctions` resolves uniquely offline. Structural
+offsets re-confirmed from code + the CCSPlayerController schema table.
 
 | Role | RVA (image base `0x180000000`) | Rediscovery |
 | --- | --- | --- |
@@ -330,10 +358,8 @@ schema registration table: find the netvar name string (e.g.
 (`mov dword [rsp+0x20], <size>` follows).
 
 ## Healthy log (success baseline)
-
-Baseline captured on PE `0x6AA1AE5E`. The same contract is expected on PE
-`0x6AC410BA` (statically revalidated; in-game confirmation pending — replace
-this note with the captured log lines after the demo test).
+Baseline captured on PE `0x6AA1AE5E` (2026-09) and re-confirmed in-game on PE
+`0x6AC7FFFA` (2026-10-10; sample lines from that run):
 
 ```text
 Radar POV: installed 8/8 hooks active enabled=1 update=1 getLocal=1 getObs=1 demoState=1
@@ -341,6 +367,7 @@ Radar POV: installed 8/8 hooks active enabled=1 update=1 getLocal=1 getObs=1 dem
 Radar POV: active — pawn ... -> observed ... (slot N team 2|3, spectatorSlot 0)
 Radar POV: demo/HLTV state 1 -> 0 for radar frame
 Radar POV: filtering demo spectator slot 0
+Radar POV: icon idx=1 type=0 vis=0x0 f17c=0x01 f17d=0x00 alive=0 life=0  (observer icon — OK)
 Radar POV: GetEntityBySlot 0 -> observed slot N
 Radar POV: icon-type native=17 team=2|3 selfTeam=... teammate=...   (first 3 icons)
 Radar POV: icon type 0x11 -> 9|13 (teammate team 2|3, self team 2|3)
@@ -349,6 +376,28 @@ Radar POV: gate idx=183 team=3 self=2 -> 1        (enemy gated → spotted-only)
 Radar POV: icon idx=5 type=13 vis=0x0 f17c=0x01 f17d=0x01 alive=1 life=0
 Radar POV: force-color teammate type=13 team=2 selfTeam=2 netvar=4 idx=4 argb=0xFF962CBD panels=6 playerIndex=5
 ```
+
+Note (PE `0x6AC7FFFA` run): the first icon-state line can legitimately read
+`type=0 ... alive=0` — that is the slot-0 **observer icon** before
+setRadarIconType has written it; it is not a layout regression.
+
+### Crash incident 2026-10-09 (PE 0x6AC7FFFA, resolved)
+
+A one-off access violation inside native radar_update (in iconColor's live
+branch for the half-initialized slot-0 observer icon, `type=0/vis=0`) froze
+the radar mid-update every frame: the `__except` swallowed the fault, and
+`/EHsc` never runs `RadarPovFrameScope`'s destructor, so the POV frame state
+leaked. Mitigations now in place (keep them):
+
+- `RecoverPovFrameAfterFault`: resets frame depth/context and restores the
+  show-all fail-safe after a caught fault.
+- `kMaxRadarUpdateFaults` (3): repeated faults disable the feature entirely —
+  the radar reverts to the native demo radar instead of freezing.
+- The SEH filter logs `faultRip` / `faultTarget` **as client.dll RVAs** — map
+  the RVA on the current binary (`tools/radar_dll_analysis.py`) to the exact
+  faulting instruction. The incident did not reproduce after the mitigation
+  build (healthy run 2026-10-10); root cause inside the live branch was not
+  pinned further.
 
 Reading notes:
 
@@ -396,6 +445,7 @@ Must **not** appear:
 | Extra freecam dot | `findPlayerBySlot` / wrong `g_spectatorSlot` |
 | Teammates missing on demo radar | Check `alive`/`life` in the icon diagnostic first (dead teammates do not draw). If alive: no `gate` lines → isSlotEnemyOf arg resolution broke (must use `ResolvePlayerByIndex`); a teammate logging `gate ... -> 1` → team/selfTeam wrong |
 | Install shape errors | Outer update shape (`84 D2` + `lea rsi,[rcx-20h]` at +0x23) or inlined-mode fingerprints |
+| Radar frozen mid-demo | `EXCEPTION in Hook_RadarUpdate` swallowed every frame — check the `faultRip`/`faultTarget` RVAs in the log line and map the RVA on the current binary (`tools/radar_dll_analysis.py <rva>`). The feature auto-disables after 3 faults (native demo radar restored) |
 | Feature completely inactive in demo | `PreparePovContext` observer chain fails AND direct-local fallback conditions not met — capture `no observer target yet` log line details |
 
 ## Update procedure after CS2 patch

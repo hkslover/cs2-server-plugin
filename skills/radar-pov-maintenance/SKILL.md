@@ -39,6 +39,7 @@ A hook success log is **not** enough. Confirm in a demo with rotation on.
 | Solid team colours for allies | Colour path (type / force-color / self team = 0) |
 | Enemies also competitive-coloured | Teammate filter broken |
 | Extra freecam dot | `findPlayerBySlot` |
+| Radar frozen mid-demo | `radar_update` exception swallowed every frame — read the `faultRip` RVA from the `EXCEPTION in Hook_RadarUpdate` log line and map it on the current binary; the feature auto-disables after 3 faults |
 | Exceptions in hooks | Bad entity type or panel vtable |
 
 ## Architecture (why not one hook)
