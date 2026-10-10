@@ -24,18 +24,18 @@ using namespace MemUtils;
 namespace {
 
 // =============================================================================
-// Design (RE-backed, validated against PE 0x6AA1AE5E): identity rewrite +
+// Design (RE-backed, validated against PE 0x6AC410BA): identity rewrite +
 // teammate type + force ARGB.
 //
 // THE demo switch: engine vtable +0x2B0 = IVEngineClient::IsHLTV()
-// (mov rcx,[global]; call [vtable+0x2B0]) — consumed at ~21 radar-path sites
-// (radar_mode, setRadarIconType, iconColor, ...). Scoped to 0 it flips the
-// whole radar into the live branch.
+// (mov rcx,[global]; call [vtable+0x2B0]) — consumed at ~29 radar-path sites
+// (radar_update inlined mode logic, setRadarIconType, iconColor, ...). Scoped
+// to 0 it flips the whole radar into the live branch.
 //
 // Hooks (8):
 //   radar_update, getLocal, GetEntityBySlot, demo/HLTV (IsHLTV),
-//   findPlayerBySlot, IsSlotEnemyOf (restore live team gate; demo-session
-//   cvar 0x182339278 reads non-zero and gates teammates into spotted-only),
+//   findPlayerBySlot, IsSlotEnemyOf (restore live team gate; its demo-session
+//   cvar path reads non-zero and gates teammates into spotted-only),
 //   SetRadarIconType (teammate 0x11→9/0xD + comp-allowed bit),
 //   RadarIconColor (force cl_teammate_color_*)
 // Colour-gate hooks removed — force-color covers them.
@@ -75,6 +75,10 @@ inline bool IsPovFrameActive()
 #endif
 
 std::atomic<int> g_faultRadarUpdate{0};
+// Module base of client.dll at install time (single write, read from the SEH
+// filter on the radar-update thread) — used to report fault RVAs.
+uintptr_t g_clientFaultBase = 0;
+size_t g_clientFaultSize = 0;
 std::atomic<int> g_faultGetLocal{0};
 std::atomic<int> g_faultResolve{0};
 std::atomic<int> g_logPovOk{0};
@@ -117,17 +121,17 @@ using GetPlayerSlotFn = void(__fastcall*)(void* pawn, int* outSlot);
 using FindPlayerBySlotFn = void*(__fastcall*)(int slot);
 // Controller-by-slot; icon colour path hardcodes GetEntityBySlot(0) as "local".
 using GetEntityBySlotFn = void*(__fastcall*)(int slot);
-// FUN_1808b0e00(localPawn, slot) — per-slot draw gate ("is this player an enemy
-// of local"). Its cvar path (0x182339278 != 0 during demo playback) returns true
-// for every non-self slot and hides unspotted teammates.
+// FUN_1808d94e0(localPawn, playerIndex) — per-slot draw gate ("is this player an
+// enemy of local"). Its cvar path (demo-session cvar != 0 during demo playback)
+// returns true for every non-self slot and hides unspotted teammates.
 // MSVC x64: __fastcall is accepted but ignored (single x64 ABI), so the
 // function pointer type omits it; identical to the engine-side call signature.
 using IsSlotEnemyOfFn = uint8_t(*)(void* localPawn, int slot);
-// FUN_180e55e00(icon, playerTeam) — writes icon type at +0x16c.
+// FUN_180ec1730(icon, playerTeam) — writes icon type at +0x16c.
 using SetRadarIconTypeFn = void(__fastcall*)(void* icon, int playerTeam);
-// FUN_180e62bc0(radar, icon) — icon colour update.
+// FUN_180ecf030(radar, icon) — icon colour update.
 using RadarIconColorFn = void(__fastcall*)(void* radar, void* icon);
-// FUN_180861bb0(outArgb, colorIndex) — cl_teammate_color_N ARGB.
+// FUN_180889e30(outArgb, colorIndex) — cl_teammate_color_N ARGB.
 using GetCompColorArgbFn = uint32_t*(__fastcall*)(uint32_t* outArgb, int colorIndex);
 // FUN_180a8c160(playerIndex) — resolve entity/controller for icon subject.
 using ResolvePlayerByIndexFn = void*(__fastcall*)(int playerIndex);
@@ -161,20 +165,20 @@ struct CreatedRadarHook {
 
 std::vector<CreatedRadarHook> g_createdRadarHooks;
 
-constexpr size_t kIsPlayerPawnVtableByteOff = 0x4D8;
-constexpr size_t kIsObserverVtableByteOff = 0xAA0;
-constexpr ptrdiff_t kPawnObserverServices = 0x1220;
+constexpr size_t kIsPlayerPawnVtableByteOff = 0x4F0;
+constexpr size_t kIsObserverVtableByteOff = 0xAC0;
+constexpr ptrdiff_t kPawnObserverServices = 0x1308;
 constexpr ptrdiff_t kRadarFromUpdateContext = -0x20;
 constexpr ptrdiff_t kIconTypeOffset = 0x16c;
 constexpr ptrdiff_t kIconPlayerIndexOffset = 0x158;
 constexpr ptrdiff_t kIconColorTimeOffset = 0x14c;
-// Engine "teammate may show competitive colours" bit (0x180e4f729, cvar==0
-// same-team path). The rewrite path sets it because the engine skips it when
-// the demo-session cvar reads non-zero.
+// Engine "teammate may show competitive colours" bit (cvar==0 same-team path,
+// icon+0x17D bit 8; PE 0x6AC410BA players loop 0xEBA780). The rewrite path sets
+// it because the engine skips it when the demo-session cvar reads non-zero.
 constexpr ptrdiff_t kIconCompAllowedOffset = 0x17d;
 constexpr uint8_t kIconCompAllowedBit = 0x8;
 constexpr ptrdiff_t kControllerTeamOffset = 0x3E7;
-constexpr ptrdiff_t kCompTeammateColorOffset = 0x850;
+constexpr ptrdiff_t kCompTeammateColorOffset = 0x858;
 constexpr size_t kPanelGetStyleVOff = 0x230;
 constexpr size_t kStyleSetColorVOff = 0x188;
 constexpr int kIconTypeLiveTeammate = 0x11;
@@ -182,6 +186,9 @@ constexpr int kIconTypeT = 9;
 constexpr int kIconTypeCT = 0xd;
 constexpr int kTeamT = 3;
 constexpr int kTeamCT = 2;
+// Consecutive-fault budget before the feature disables itself and the radar
+// falls back to the native demo path instead of freezing mid-update forever.
+constexpr int kMaxRadarUpdateFaults = 3;
 // Same panels FUN_180e460e0 paints for competitive ARGB (T then CT sets).
 constexpr ptrdiff_t kCompColorPanelOffs[] = {0x60, 0x68, 0x70, 0x80, 0x88, 0x90};
 ptrdiff_t g_radarShowAllFlagOffset = 0;
@@ -702,17 +709,61 @@ private:
     uint8_t* radar_ = nullptr;
 };
 
+int LogRadarUpdateFault(unsigned int code, EXCEPTION_POINTERS* info)
+{
+    if (g_faultRadarUpdate.fetch_add(1) == 0) {
+        uintptr_t rip = 0;
+        uintptr_t target = 0;
+        if (info != nullptr && info->ExceptionRecord != nullptr) {
+            rip = reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+            // Read/write access faults carry the inaccessible address in [1].
+            target = static_cast<uintptr_t>(
+                info->ExceptionRecord->ExceptionInformation[1]);
+        }
+        const bool haveBase = g_clientFaultBase != 0;
+        const bool ripInside = haveBase && rip >= g_clientFaultBase &&
+            rip < g_clientFaultBase + g_clientFaultSize;
+        const bool targetInside = haveBase && target >= g_clientFaultBase &&
+            target < g_clientFaultBase + g_clientFaultSize;
+        Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08X) faultRip=%p "
+            "faultTarget=%p (RVA rip=0x%zX target=0x%zX)",
+            code, reinterpret_cast<void*>(rip), reinterpret_cast<void*>(target),
+            ripInside ? static_cast<size_t>(rip - g_clientFaultBase) : 0,
+            targetInside ? static_cast<size_t>(target - g_clientFaultBase) : 0);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void RecoverPovFrameAfterFault(void* updateContext)
+{
+    // The SEH unwind above skipped RadarPovFrameScope's destructor (MSVC /EHsc
+    // does not run C++ destructors for asynchronous exceptions), so the POV
+    // frame state leaks: depth stays > 0 ("enabled" reads stale-true) and
+    // the identity substitutions keep applying outside a valid frame. Reset
+    // it here and fall back to the native demo radar (show-all ON) for this
+    // frame; repeated faults disable the feature entirely.
+    g_povFrame.depth = 0;
+    ClearPovContext();
+    if (updateContext != nullptr) {
+        SetShowAllFlag(reinterpret_cast<uint8_t*>(updateContext) + kRadarFromUpdateContext,
+                       true);
+    }
+    if (g_faultRadarUpdate.load() >= kMaxRadarUpdateFaults) {
+        g_enabled.store(false, std::memory_order_release);
+        Log("Radar POV: %d exceptions inside radar_update — feature disabled, "
+            "native demo radar restored",
+            g_faultRadarUpdate.load());
+    }
+}
+
 void CallOriginalRadarUpdate(void* updateContext, uint8_t updateEnabled)
 {
     __try {
         if (g_origRadarUpdate != nullptr) {
             g_origRadarUpdate(updateContext, updateEnabled);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (g_faultRadarUpdate.fetch_add(1) == 0) {
-            Log("Radar POV: EXCEPTION in Hook_RadarUpdate (code=0x%08lX) context=%p",
-                GetExceptionCode(), updateContext);
-        }
+    } __except (LogRadarUpdateFault(GetExceptionCode(), GetExceptionInformation())) {
+        RecoverPovFrameAfterFault(updateContext);
     }
 }
 
@@ -755,14 +806,14 @@ void* __fastcall Hook_FindPlayerBySlot(int slot)
     return g_origFindPlayerBySlot != nullptr ? g_origFindPlayerBySlot(slot) : nullptr;
 }
 
-// FUN_1808b0e00(localPawn, playerIndex) — per-slot draw gate ("is this player
+// FUN_1808d94e0(localPawn, playerIndex) — per-slot draw gate ("is this player
 // an enemy of local"). The engine's live branch compares the player's team
-// against the local player's team; but its team-colour cvar path (0x182339278,
-// reads non-zero during demo playback) returns true for every non-self entry,
+// against the local player's team; but its demo-session cvar path
+// (reads non-zero during demo playback) returns true for every non-self entry,
 // which gates teammates behind the spotted bit and hides the unspotted ones.
 //
 // The second argument is the players loop's converted player index
-// (0x180a8baa0 result), not the raw slot — resolve it exactly like the native
+// (0x180aca730 result), not the raw slot — resolve it exactly like the native
 // gate does (ResolvePlayerByIndex), with a slot lookup as a validated fallback.
 uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int playerIndex)
 {
@@ -809,7 +860,7 @@ uint8_t __fastcall Hook_IsSlotEnemyOf(void* localPawn, int playerIndex)
 // for POV teammates only (never rewrite enemy icons).
 //
 // New-build fact (radare2): the visible sub-panel is indexed by the type bit
-// (per-frame updater 0xE57E20 builds visibility flags `1 << type`), so rewriting
+// (per-frame updater 0xE99B40-class builds visibility flags `1 << type`), so rewriting
 // the type byte alone switches the rendered body to the competitive-colour panel.
 void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
 {
@@ -837,7 +888,7 @@ void __fastcall Hook_SetRadarIconType(void* icon, int playerTeam)
         *typePtr = fixed;
         // Mirror the engine's cvar==0 teammate path: set the "competitive colours
         // allowed" bit that the players loop skips when the demo-session cvar
-        // reads non-zero (0x180e4f729).
+        // reads non-zero (icon+0x17D bit 8).
         auto* flags17d = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(icon) +
                                                     kIconCompAllowedOffset);
         *flags17d = static_cast<uint8_t>(*flags17d | kIconCompAllowedBit);
@@ -1009,8 +1060,10 @@ void __fastcall Hook_RadarIconColor(void* radar, void* icon)
                     void* pl = g_resolvePlayerByIndex(idx);
                     if (pl != nullptr) {
                         auto* pb = reinterpret_cast<uint8_t*>(pl);
-                        alive = pb[0x91c];
-                        life = *reinterpret_cast<int*>(pb + 0x6ec);
+                        // m_bPawnIsAlive @ +0x934 and the life-state int @
+                        // +0x6F4 (CCSPlayerController schema, PE 0x6AC410BA).
+                        alive = pb[0x934];
+                        life = *reinterpret_cast<int*>(pb + 0x6f4);
                     }
                 }
                 Log("Radar POV: icon idx=%d type=%d vis=0x%X f17c=0x%02X f17d=0x%02X "
@@ -1078,6 +1131,8 @@ void ResetResolvedRadarState()
     g_iconTypeHooked = false;
     g_iconColorHooked = false;
     g_radarDemoStateGlobalSlot = 0;
+    g_clientFaultBase = 0;
+    g_clientFaultSize = 0;
     g_radarShowAllFlagOffset = 0;
     g_installed.store(false, std::memory_order_release);
 }
@@ -1113,6 +1168,8 @@ bool InstallHooks()
     }
     Log("Radar POV: client.dll @ %p size=0x%zx PE-timestamp=0x%08X", client.base, client.size,
         GetPeTimestamp(client));
+    g_clientFaultBase = reinterpret_cast<uintptr_t>(client.base);
+    g_clientFaultSize = client.size;
 
     if (!ResolveRadarFunctions(client)) {
         return false;

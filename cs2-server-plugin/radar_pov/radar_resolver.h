@@ -6,11 +6,18 @@
 #include <cstddef>
 #include <cstdint>
 
+// Implementation guard: native plugin build (_WIN32) or the offline static
+// resolver validation harness (RADAR_POV_RESOLVER_STATIC_TEST), which maps a
+// client.dll file image and re-runs ResolveRadarFunctions unchanged.
+#if defined(_WIN32) || defined(RADAR_POV_RESOLVER_STATIC_TEST)
+#define RADAR_POV_RESOLVER_IMPL 1
+#endif
+
 namespace RadarPovResolver {
 
 void SetLogger(RadarPovLogFn logger);
 
-#ifdef _WIN32
+#ifdef RADAR_POV_RESOLVER_IMPL
 
 using RadarUpdateFn = void(__fastcall*)(void* updateContext, uint8_t updateEnabled);
 using GetLocalFn = void*(__fastcall*)();
@@ -46,8 +53,10 @@ struct ResolvedState {
     ptrdiff_t radarShowAllFlagOffset = 0;
 };
 
+#ifdef RADAR_POV_RESOLVER_IMPL
 bool ResolveRadarFunctions(const MemUtils::ModuleInfo& client, ResolvedState& resolved);
-
 #endif
+
+#endif  // RADAR_POV_RESOLVER_IMPL
 
 }  // namespace RadarPovResolver

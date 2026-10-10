@@ -7,7 +7,7 @@ namespace RadarPovResolver {
 namespace {
 RadarPovLogFn g_log = nullptr;
 
-#ifdef _WIN32
+#ifdef RADAR_POV_RESOLVER_IMPL
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -33,7 +33,7 @@ void SetLogger(RadarPovLogFn logger)
     g_log = logger;
 }
 
-#ifdef _WIN32
+#ifdef RADAR_POV_RESOLVER_IMPL
 
 using namespace MemUtils;
 
@@ -108,21 +108,27 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
     static const char kPatGetEntityBySlot[] =
         "48 83 EC 28 83 F9 FF 75 17 48 8B 0D ?? ?? ?? ?? 48 8D 54 24 30 48 8B 01 "
         "FF 90 10 03 00 00 8B 08 48 63 C1 48 8D 0D ?? ?? ?? ?? 48 8B 04 C1 48 83 C4 28 C3";
-    static const char kPatIsSpectatorCheck[] =
-        "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
-        "80 BB E7 03 00 00 01";
     static const char kPatSetRadarIconType[] =
         "40 56 57 41 56 48 83 EC 20 8B FA 4C 8B F1 E8";
+    // GetCompColorArgb (PE 0x6AC410BA): mov r8,rcx; cmp edx,-1; jge;
+    // mov dword [rcx],0xFFC8C8C8 (unset fallback colour).
     static const char kPatGetCompColorArgb[] =
-        "40 53 48 83 EC 20 48 8B D9 83 FA FF 7D";
+        "4C 8B C1 83 FA FF 7D 0A C7 01 C8 C8 C8 FF";
     static const char kPatRadarIconColor[] =
         "48 85 D2 0F 84 ?? ?? ?? ?? 56 41 57 48 83 EC 58";
     static const char kPatGetPlayerSlotCall[] =
         "48 8D 54 24 24 48 8B C8 E8";
+    // Players-loop call site: mov ecx,edi; call findPlayerBySlot; mov [rsp+d],rax;
+    // mov rbx,rax; test rax,rax — the saved stack-slot displacement varies
+    // between builds, keep it wildcarded.
     static const char kPatFindPlayerBySlotCall[] =
-        "8B CF E8 ?? ?? ?? ?? 48 89 44 24 58 48 8B D8 48 85 C0";
-    static const char kPatObserverField[] = "20 12 00 00";
-    static const char kPatShowAllFlag[] = "80 A3 ?? ?? ?? ?? FE";
+        "8B CF E8 ?? ?? ?? ?? 48 89 44 24 ?? 48 8B D8 48 85 C0";
+    // getObs prologue: mov rcx,[rcx+0x1308] (pawn observer-services field).
+    static const char kPatObserverField[] = "48 8B 89 08 13 00 00";
+    // radar_update inlined mode logic clears/sets the shared show-all flag on
+    // the radar (rsi) with the same disp32: and/or byte ptr [rsi+disp],0xFE/1.
+    static const char kPatShowAllFlagClear[] = "80 A6 ?? ?? ?? ?? FE";
+    static const char kPatShowAllFlagSet[] = "80 8E ?? ?? ?? ?? 01";
     static const char kPatDemoState[] =
         "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 B0 02 00 00";
 
@@ -214,15 +220,15 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
         "candidates=1 registration=%p",
         reinterpret_cast<void*>(convarObj), rva(convarObj), reinterpret_cast<void*>(regFn));
 
-    const auto convarXrefs = FindLeaRipXrefs(client, convarObj);
-    struct ModeCandidate {
-        uintptr_t modeFn = 0;
-        uintptr_t callSite = 0;
-        uintptr_t callerFn = 0;
-    };
-    std::vector<ModeCandidate> modeCandidates;
-    const auto isRadarUpdateShape = [&](uintptr_t address, uintptr_t modeFn) -> bool {
-        if (!validFunction(address, 0x27) || address == modeFn) {
+    // radar_update (since PE 0x6AC410BA): the former radar_mode function is
+    // inlined into the outer update.  The inlined mode logic reads the cvar
+    // through a global pointer slot adjacent to the ConVar object
+    // (mov r64,[rip+slot]; cmp byte [r64+0x58], ...); readers of that slot
+    // seed the update-function candidates, validated by the update prologue
+    // shape (test dl,dl; ...; lea rsi,[rcx-0x20] at +0x23) plus the inlined
+    // mode fingerprints (show-all clear/set pair with one disp, IsHLTV call).
+    const auto isRadarUpdateShape = [&](uintptr_t address) -> bool {
+        if (!validFunction(address, 0x27)) {
             return false;
         }
         const uint8_t* body = reinterpret_cast<const uint8_t*>(address);
@@ -231,64 +237,93 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
             body[0x23] == 0x48 && body[0x24] == 0x8D && body[0x25] == 0x71 &&
             body[0x26] == 0xE0;
     };
-    for (uintptr_t xref : convarXrefs) {
-        const uintptr_t fn = FindFunctionStart(client, xref);
-        if (!validFunction(fn) || fn == regFn) {
-            continue;
-        }
-        const auto callSites = FindE8CallSites(client, fn);
-        if (callSites.empty()) {
-            continue;
-        }
-        const size_t size = functionSize(fn);
-        const auto showAllHits = FindPatternAll(reinterpret_cast<const uint8_t*>(fn), size,
-                                                kPatShowAllFlag,
-                                                std::numeric_limits<size_t>::max());
-        const auto demoStateHits = FindPatternAll(reinterpret_cast<const uint8_t*>(fn), size,
-                                                  kPatDemoState,
-                                                  std::numeric_limits<size_t>::max());
-        Log("Radar POV: ConVar reader @ %p RVA=0x%zx callers=%zu showAllCandidates=%zu "
-            "demoStateCandidates=%zu",
-            reinterpret_cast<void*>(fn), rva(fn), callSites.size(), showAllHits.size(),
-            demoStateHits.size());
-        if (showAllHits.size() != 1 || demoStateHits.size() != 1) {
-            continue;
-        }
-        for (uintptr_t callSite : callSites) {
-            const uintptr_t callerFn = FindFunctionStart(client, callSite);
-            if (!isRadarUpdateShape(callerFn, fn)) {
+    std::vector<uintptr_t> updateCandidates;
+    {
+        // RIP-relative loads (mov r64,[rip+rel]) targeting qwords within the
+        // ConVar object's immediate neighbourhood — the pointer slot holding
+        // the registered ConVar at runtime.
+        std::vector<uintptr_t> readers;
+        for (size_t i = 0; i + 7 <= codeSize; ++i) {
+            if ((codeBase[i] != 0x48 && codeBase[i] != 0x4C) || codeBase[i + 1] != 0x8B ||
+                (codeBase[i + 2] & 0xC7) != 0x05) {
+                continue;
+            }
+            const uintptr_t insn = reinterpret_cast<uintptr_t>(codeBase + i);
+            const int32_t rel = *reinterpret_cast<const int32_t*>(codeBase + i + 3);
+            const uintptr_t target = insn + 7 + static_cast<intptr_t>(rel);
+            if (target < convarObj || target >= convarObj + 0x20) {
                 continue;
             }
             bool duplicate = false;
-            for (const ModeCandidate& candidate : modeCandidates) {
-                if (candidate.modeFn == fn && candidate.callSite == callSite &&
-                    candidate.callerFn == callerFn) {
+            for (uintptr_t seen : readers) {
+                if (seen == insn) {
                     duplicate = true;
                     break;
                 }
             }
             if (!duplicate) {
-                modeCandidates.push_back({fn, callSite, callerFn});
+                readers.push_back(insn);
+            }
+        }
+        Log("Radar POV: ConVar pointer-slot readers=%zu", readers.size());
+        for (uintptr_t reader : readers) {
+            const uintptr_t fn = FindFunctionStart(client, reader);
+            if (!isRadarUpdateShape(fn)) {
+                continue;
+            }
+            const size_t size = functionSize(fn);
+            const auto clearHits = FindPatternAll(reinterpret_cast<const uint8_t*>(fn), size,
+                                                  kPatShowAllFlagClear,
+                                                  std::numeric_limits<size_t>::max());
+            const auto setHits = FindPatternAll(reinterpret_cast<const uint8_t*>(fn), size,
+                                                kPatShowAllFlagSet,
+                                                std::numeric_limits<size_t>::max());
+            const auto demoHits = FindPatternAll(reinterpret_cast<const uint8_t*>(fn), size,
+                                                 kPatDemoState,
+                                                 std::numeric_limits<size_t>::max());
+            if (clearHits.size() != 1 || setHits.empty() || demoHits.empty()) {
+                continue;
+            }
+            const ptrdiff_t clearDisp =
+                *reinterpret_cast<const int32_t*>(clearHits[0] + 2);
+            bool paired = false;
+            for (const uint8_t* setHit : setHits) {
+                if (*reinterpret_cast<const int32_t*>(setHit + 2) == clearDisp) {
+                    paired = true;
+                    break;
+                }
+            }
+            if (!paired) {
+                continue;
+            }
+            bool duplicate = false;
+            for (uintptr_t candidate : updateCandidates) {
+                if (candidate == fn) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                updateCandidates.push_back(fn);
             }
         }
     }
-    Log("Radar POV: radar mode/caller candidates=%zu", modeCandidates.size());
-    if (modeCandidates.size() != 1) {
-        Log("Radar POV: radar mode resolver rejected (%s)",
-            modeCandidates.empty() ? "not found" : "ambiguous");
+    Log("Radar POV: radar_update candidates=%zu", updateCandidates.size());
+    if (updateCandidates.size() != 1) {
+        Log("Radar POV: radar_update resolver rejected (%s)",
+            updateCandidates.empty() ? "not found" : "ambiguous");
         return false;
     }
-    const uintptr_t radarModeFn = modeCandidates[0].modeFn;
-    const uintptr_t modeCallSite = modeCandidates[0].callSite;
-    const uintptr_t radarUpdateFn = modeCandidates[0].callerFn;
-    logResolved("radar_mode", radarModeFn, "ConVar LEA -> unique reader -> update shape", 1);
-    logResolved("radar_update", radarUpdateFn, "radar_mode E8 caller shape", 1);
+    const uintptr_t radarUpdateFn = updateCandidates[0];
+    logResolved("radar_update", radarUpdateFn,
+                "ConVar pointer-slot reader + update shape + inlined mode", 1);
 
-    // and byte ptr [radar+disp32], 0FEh
+    // and byte ptr [radar+disp32], 0FEh — extracted from the inlined mode logic
+    // inside radar_update.
     if (const uintptr_t hitAddress = uniquePattern("show-all flag",
-                                                   reinterpret_cast<const uint8_t*>(radarModeFn),
-                                                   functionSize(radarModeFn), kPatShowAllFlag,
-                                                   true)) {
+                                                   reinterpret_cast<const uint8_t*>(radarUpdateFn),
+                                                   functionSize(radarUpdateFn),
+                                                   kPatShowAllFlagClear, true)) {
         const uint8_t* hit = reinterpret_cast<const uint8_t*>(hitAddress);
         g_radarShowAllFlagOffset =
             static_cast<ptrdiff_t>(*reinterpret_cast<const uint32_t*>(hit + 2));
@@ -299,14 +334,14 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
     }
     Log("Radar POV: show-all flag offset=0x%zx", static_cast<size_t>(g_radarShowAllFlagOffset));
 
-    // mov rcx,[rip+global]; mov rax,[rcx]; call [rax+2B0h]
+    // mov rcx,[rip+global]; mov rax,[rcx]; call [rax+2B0h] — inside radar_update
     if (const uintptr_t hitAddress = uniquePattern("demo/HLTV state",
-                                                   reinterpret_cast<const uint8_t*>(radarModeFn),
-                                                   functionSize(radarModeFn), kPatDemoState, true)) {
+                                                   reinterpret_cast<const uint8_t*>(radarUpdateFn),
+                                                   functionSize(radarUpdateFn), kPatDemoState, true)) {
         const uint8_t* hit = reinterpret_cast<const uint8_t*>(hitAddress);
         const int32_t rel = *reinterpret_cast<const int32_t*>(hit + 3);
-        const size_t off = static_cast<size_t>(hit - reinterpret_cast<const uint8_t*>(radarModeFn));
-        const uintptr_t slot = radarModeFn + off + 7 + static_cast<intptr_t>(rel);
+        const size_t off = static_cast<size_t>(hit - reinterpret_cast<const uint8_t*>(radarUpdateFn));
+        const uintptr_t slot = radarUpdateFn + off + 7 + static_cast<intptr_t>(rel);
         if (IsInsideModule(client, slot)) {
             g_radarDemoStateGlobalSlot = slot;
         }
@@ -320,39 +355,25 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
 
     uintptr_t radarPlayersFn = 0;
     {
-        const uintptr_t scanFrom = modeCallSite + 5;
-        std::vector<uintptr_t> afterMode;
+        // radar_update calls the players loop directly; identify it among all
+        // update-body callees by the paired slot/find-slot call-site shapes.
         const size_t updateSize = functionSize(radarUpdateFn);
-        const uintptr_t updateEnd = radarUpdateFn + updateSize;
-        if (!IsInsideText(client, scanFrom) || scanFrom >= updateEnd) {
-            Log("Radar POV: radar players scan site is outside radar_update function");
-            return false;
-        }
-        const size_t available = static_cast<size_t>(updateEnd - scanFrom);
-        const size_t scanSize = available < 0x80 ? available : 0x80;
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(scanFrom);
-        for (size_t i = 0; i + 5 <= scanSize; ++i) {
-            uintptr_t target = 0;
-            if (!DecodeRel32Call(p + i, scanFrom + i, target)) {
-                continue;
-            }
-            if (!IsInsideText(client, target) || target == radarModeFn) {
-                continue;
-            }
+        const auto updateCalls = CollectDirectCalls(client, radarUpdateFn, updateSize);
+        std::vector<uintptr_t> uniqueUpdateCalls;
+        for (uintptr_t callTarget : updateCalls) {
             bool duplicate = false;
-            for (uintptr_t candidate : afterMode) {
-                if (candidate == target) {
+            for (uintptr_t candidate : uniqueUpdateCalls) {
+                if (candidate == callTarget) {
                     duplicate = true;
                     break;
                 }
             }
             if (!duplicate) {
-                afterMode.push_back(target);
+                uniqueUpdateCalls.push_back(callTarget);
             }
-            i += 4;
         }
         std::vector<uintptr_t> playerCandidates;
-        for (uintptr_t candidate : afterMode) {
+        for (uintptr_t candidate : uniqueUpdateCalls) {
             if (!validFunction(candidate)) {
                 continue;
             }
@@ -363,20 +384,22 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
             const auto findHits = FindPatternAll(reinterpret_cast<const uint8_t*>(candidate), size,
                                                  kPatFindPlayerBySlotCall,
                                                  std::numeric_limits<size_t>::max());
-            Log("Radar POV: post-mode call candidate @ %p RVA=0x%zx size=0x%zx "
-                "getSlotCandidates=%zu findSlotCandidates=%zu",
-                reinterpret_cast<void*>(candidate), rva(candidate), size, slotHits.size(),
-                findHits.size());
+            if (!slotHits.empty() || !findHits.empty()) {
+                Log("Radar POV: radar_update call candidate @ %p RVA=0x%zx size=0x%zx "
+                    "getSlotCandidates=%zu findSlotCandidates=%zu",
+                    reinterpret_cast<void*>(candidate), rva(candidate), size, slotHits.size(),
+                    findHits.size());
+            }
             if (slotHits.size() == 1 && findHits.size() == 1) {
                 playerCandidates.push_back(candidate);
             }
         }
-        Log("Radar POV: radar players candidates=%zu (post-mode calls=%zu)",
-            playerCandidates.size(), afterMode.size());
+        Log("Radar POV: radar players candidates=%zu (update calls=%zu)",
+            playerCandidates.size(), uniqueUpdateCalls.size());
         if (playerCandidates.size() == 1) {
             radarPlayersFn = playerCandidates[0];
             logResolved("radar_players", radarPlayersFn,
-                        "radar_update post-mode call + slot/find-slot structure", 1);
+                        "radar_update call + slot/find-slot structure", 1);
         }
     }
     if (radarPlayersFn == 0) {
@@ -517,96 +540,6 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
         reinterpret_cast<void*>(getLocalFn), reinterpret_cast<void*>(getPlayerSlotFn),
         reinterpret_cast<void*>(getObsFn), reinterpret_cast<void*>(findPlayerBySlotFn));
 
-    // GetEntityBySlot: use the spectator-check call graph when available.  A
-    // pattern-only result is accepted only when it is unique.
-    {
-        auto looksLikeGetEntityBySlot = [&](uintptr_t fn) -> bool {
-            return validFunction(fn) &&
-                MatchPattern(reinterpret_cast<const uint8_t*>(fn), functionSize(fn),
-                             kPatGetEntityBySlot);
-        };
-
-        const uintptr_t isSpecFn = uniquePattern("is-spectator check", codeBase, codeSize,
-                                                kPatIsSpectatorCheck, true);
-        if (isSpecFn == 0) {
-            return false;
-        }
-
-        std::vector<uintptr_t> callChainCandidates;
-        const uintptr_t codeAddress = reinterpret_cast<uintptr_t>(codeBase);
-        for (size_t i = 0; i + 5 <= codeSize; ++i) {
-            if (codeBase[i] != 0xE8) {
-                continue;
-            }
-            uintptr_t target = 0;
-            if (!DecodeRel32Call(codeBase + i, codeAddress + i, target) || target != isSpecFn) {
-                continue;
-            }
-            const size_t callOff = i;
-            const size_t backStart = callOff > 0x40 ? callOff - 0x40 : 0;
-            for (size_t j = backStart; j + 1 < callOff; ++j) {
-                if (codeBase[j] != 0x33 || codeBase[j + 1] != 0xC9) {
-                    continue;
-                }
-                for (size_t k = j; k + 5 <= callOff; ++k) {
-                        uintptr_t getEnt = 0;
-                        if (!DecodeRel32Call(codeBase + k, codeAddress + k, getEnt)) {
-                            continue;
-                        }
-                        if (getEnt == isSpecFn || !looksLikeGetEntityBySlot(getEnt)) {
-                            continue;
-                        }
-                        bool duplicate = false;
-                        for (uintptr_t candidate : callChainCandidates) {
-                            if (candidate == getEnt) {
-                                duplicate = true;
-                                break;
-                            }
-                        }
-                        if (!duplicate) {
-                            callChainCandidates.push_back(getEnt);
-                        }
-                    }
-            }
-        }
-        Log("Radar POV: GetEntityBySlot call-chain candidates=%zu", callChainCandidates.size());
-        if (callChainCandidates.size() == 1) {
-            g_origGetEntityBySlot =
-                reinterpret_cast<GetEntityBySlotFn>(callChainCandidates[0]);
-            logResolved("getEntityBySlot", callChainCandidates[0],
-                        "is-spectator call chain + function pattern", 1);
-        } else if (callChainCandidates.size() > 1) {
-            Log("Radar POV: GetEntityBySlot resolver rejected (ambiguous call chain)");
-            return false;
-        } else {
-            const auto hits = FindPatternAll(codeBase, codeSize, kPatGetEntityBySlot,
-                                             std::numeric_limits<size_t>::max());
-            Log("Radar POV: GetEntityBySlot pattern candidates=%zu", hits.size());
-            if (hits.size() == 1 &&
-                looksLikeGetEntityBySlot(reinterpret_cast<uintptr_t>(hits[0]))) {
-                const uintptr_t target = reinterpret_cast<uintptr_t>(hits[0]);
-                g_origGetEntityBySlot = reinterpret_cast<GetEntityBySlotFn>(target);
-                logResolved("getEntityBySlot", target, "unique function pattern fallback", 1);
-            } else if (hits.size() != 1) {
-                Log("Radar POV: GetEntityBySlot resolver rejected (%s)",
-                    hits.empty() ? "not found" : "ambiguous pattern");
-            }
-        }
-
-        if (g_origGetEntityBySlot == nullptr) {
-            Log("Radar POV: GetEntityBySlot not found");
-            return false;
-        }
-    }
-
-    const uintptr_t compColorFn = uniquePattern("GetCompColorArgb", codeBase, codeSize,
-                                                kPatGetCompColorArgb, true);
-    if (compColorFn == 0 || !validFunction(compColorFn)) {
-        return false;
-    }
-    g_getCompColorArgb = reinterpret_cast<GetCompColorArgbFn>(compColorFn);
-    logResolved("GetCompColorArgb", compColorFn, "unique function pattern", 1);
-
     // RadarIconColor and its player-index resolver must agree structurally.
     // The short prologue can occur in another function, so uniqueness is
     // decided only after the relationship call is checked.
@@ -663,6 +596,56 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
     logResolved("ResolvePlayerByIndex", radarColorCandidates[0].resolveFn,
                 "radarIconColor player-index call", 1);
 
+    // GetEntityBySlot: the full-body pattern can also hit a twin function in
+    // some builds; disambiguate with the radarIconColor call graph — the icon
+    // colour path resolves the local controller with xor ecx,ecx; call.  A
+    // pattern-only result is accepted only when it is unique.
+    {
+        const size_t iconColorSize = functionSize(radarIconColorFn);
+        const auto iconColorCalls = CollectDirectCalls(client, radarIconColorFn, iconColorSize);
+        const auto hits = FindPatternAll(codeBase, codeSize, kPatGetEntityBySlot,
+                                         std::numeric_limits<size_t>::max());
+        std::vector<uintptr_t> callGraphCandidates;
+        for (const uint8_t* hit : hits) {
+            const uintptr_t fn = reinterpret_cast<uintptr_t>(hit);
+            if (!validFunction(fn)) {
+                continue;
+            }
+            for (uintptr_t callTarget : iconColorCalls) {
+                if (callTarget == fn) {
+                    callGraphCandidates.push_back(fn);
+                    break;
+                }
+            }
+        }
+        Log("Radar POV: GetEntityBySlot pattern candidates=%zu call-graph candidates=%zu",
+            hits.size(), callGraphCandidates.size());
+        if (callGraphCandidates.size() == 1) {
+            g_origGetEntityBySlot =
+                reinterpret_cast<GetEntityBySlotFn>(callGraphCandidates[0]);
+            logResolved("getEntityBySlot", callGraphCandidates[0],
+                        "radarIconColor call graph + function pattern", 1);
+        } else if (callGraphCandidates.empty() && hits.size() == 1 &&
+                   validFunction(reinterpret_cast<uintptr_t>(hits[0]))) {
+            const uintptr_t target = reinterpret_cast<uintptr_t>(hits[0]);
+            g_origGetEntityBySlot = reinterpret_cast<GetEntityBySlotFn>(target);
+            logResolved("getEntityBySlot", target, "unique function pattern fallback", 1);
+        } else {
+            Log("Radar POV: GetEntityBySlot resolver rejected (%s)",
+                hits.empty() ? "not found" : "ambiguous");
+            return false;
+        }
+    }
+
+    // GetCompColorArgb: unique function pattern (unset fallback colour write).
+    const uintptr_t compColorFn = uniquePattern("GetCompColorArgb", codeBase, codeSize,
+                                                kPatGetCompColorArgb, true);
+    if (compColorFn == 0 || !validFunction(compColorFn)) {
+        return false;
+    }
+    g_getCompColorArgb = reinterpret_cast<GetCompColorArgbFn>(compColorFn);
+    logResolved("GetCompColorArgb", compColorFn, "unique function pattern", 1);
+
     g_origRadarUpdate = reinterpret_cast<RadarUpdateFn>(radarUpdateFn);
     g_origGetLocal = reinterpret_cast<GetLocalFn>(getLocalFn);
     g_getObserverTarget = reinterpret_cast<GetObserverTargetFn>(getObsFn);
@@ -679,6 +662,6 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
 }
 
 
-#endif  // _WIN32
+#endif  // RADAR_POV_RESOLVER_IMPL
 
 }  // namespace RadarPovResolver

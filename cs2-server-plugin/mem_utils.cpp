@@ -462,8 +462,14 @@ std::vector<uintptr_t> CollectDirectCalls(const ModuleInfo& mod, uintptr_t fn, s
         if (DecodeRel32Call(p + i, fn + i, target)) {
             if (IsInRange(codeBase, codeSize, target)) {
                 calls.push_back(target);
+                // The decoded call lands inside the module: treat the five
+                // bytes as one call instruction.  A decoded target outside
+                // the image means the E8 byte was instruction data (e.g. the
+                // trailing byte of `mov ebp, eax`), so advance a single byte
+                // and keep the stream in sync instead of skipping the real
+                // call that follows.
+                i += 4;
             }
-            i += 4;
         }
     }
     return calls;
