@@ -127,7 +127,7 @@ nlohmann::json BuildDebugDemoStateMessage(
     const std::string& sessionID,
     const std::string& demoPath,
     bool playing,
-    int tick)
+    bool paused)
 {
     nlohmann::json msg;
     msg["name"] = "debug_demo_state";
@@ -135,7 +135,7 @@ nlohmann::json BuildDebugDemoStateMessage(
         {"session_id", sessionID},
         {"demo_path", demoPath},
         {"playing", playing},
-        {"tick", tick},
+        {"paused", paused},
     };
     return msg;
 }

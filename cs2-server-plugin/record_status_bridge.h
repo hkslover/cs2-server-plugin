@@ -28,8 +28,11 @@ nlohmann::json BuildDebugCommandResultMessage(
     const std::string& requestID,
     const std::string& status,
     const std::string& error);
+// Playback observation for the debug workbench. `paused` is read from the
+// engine on the game thread; the message deliberately carries no tick, since
+// the desktop no longer displays it and never infers pause from tick growth.
 nlohmann::json BuildDebugDemoStateMessage(
     const std::string& sessionID,
     const std::string& demoPath,
     bool playing,
-    int tick);
+    bool paused);

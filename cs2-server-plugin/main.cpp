@@ -97,6 +97,10 @@ string gameInfoBackupPath;
 const char* demoPath = NULL;
 std::string activeDemoPath;
 bool isPlayingDemo = false;
+// Engine pause observation for the debug workbench. Only the game thread
+// writes/reads it; the debug host treats it as playback state, not a session
+// status. Kept alongside isPlayingDemo so the frame hook can detect changes.
+bool isDemoPaused = false;
 std::atomic<int> currentTick{-1};
 std::atomic<bool> isQuitting{false};
 bool shouldDeleteLogFile = true;
@@ -130,7 +134,11 @@ std::atomic<bool> exitAfterWebSocketAck{false};
 // Interactive debug protocol gate. Empty unless the host launched this game
 // with CSDM_DEBUG_SESSION, which keeps formal production behavior unchanged.
 std::string debugSessionID;
-const int DEBUG_PROTOCOL_VERSION = 1;
+// Version 2 changed the playback observation to `{session_id, demo_path,
+// playing, paused}`: the current-tick field was removed and engine pause
+// reporting was added. The host rejects older DLLs so a missing pause field is
+// never shown as a working pause button.
+const int DEBUG_PROTOCOL_VERSION = 2;
 // Deferred debug playback commands (the debug-draft game settings) applied once
 // on the game thread when the requested Demo's playback is confirmed. Plugin special
 // actions are initialized when the play request is handled, so only ordinary
@@ -867,7 +875,13 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
         // Observe the actual engine path, including requests while another
         // Demo is still playing. Do not relabel its frames as the new Demo.
         const bool playing = engine->IsPlayingDemo();
+        // The internal tick still drives replay confirmation in
+        // DebugPlaybackGate; it is never reported to the desktop.
         const int tick = demo ? demo->GetDemoTick() : -1;
+        // Pause is an engine fact of the loaded Demo. A paused Demo stays
+        // "playing" until it is stopped or unloaded, so the two flags are
+        // reported independently and never derived from tick growth.
+        const bool paused = demo != NULL && playing && demo->IsDemoPaused();
         const char* enginePath = engine->GetDemoFilePath();
         const std::string observedPath = enginePath ? enginePath : "";
         const bool confirmed = debugPlaybackGate.Observe(observedPath, playing && demo != NULL, tick);
@@ -878,11 +892,12 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
         } else if (playing && !observedPath.empty()) {
             activeDemoPath = observedPath;
         }
-        if (confirmed || playing != isPlayingDemo ||
+        if (confirmed || playing != isPlayingDemo || paused != isDemoPaused ||
             NormalizeDebugDemoPath(activeDemoPath) != NormalizeDebugDemoPath(previousPath)) {
-            SendMsg(BuildDebugDemoStateMessage(debugSessionID, activeDemoPath, playing, tick));
+            SendMsg(BuildDebugDemoStateMessage(debugSessionID, activeDemoPath, playing, paused));
         }
         isPlayingDemo = playing;
+        isDemoPaused = paused;
         currentTick = tick;
         // Interactive playback never executes the production tick sequences.
         // Also observe stop when the Demo file interface has disappeared.

@@ -40,10 +40,12 @@ Only active when `CSDM_DEBUG_SESSION` is non-empty. These messages are separate
 from the production queue protocol and never touch the queue acknowledgement or
 completion handlers.
 
-- Plugin → `debug_session_ready` with `{session_id, protocol_version: 1}`. Sent
+- Plugin → `debug_session_ready` with `{session_id, protocol_version: 2}`. Sent
   once the WebSocket connection is open and the game-thread frame hook has
   resolved the engine and reached the command-consumption path,
-  and resent on every reconnect. It does not mean a Demo is playing.
+  and resent on every reconnect. It does not mean a Demo is playing. The host
+  rejects other protocol versions and asks the user to update the plugin, so an
+  older DLL cannot be mistaken for a pause-capable one.
 - The `FrameStageNotify` command hook is installed as soon as the client
   interface is available. Plugin `Connect` attempts installation; in debug
   mode a separate bootstrap worker retries every 100 ms until it succeeds or
@@ -74,11 +76,15 @@ completion handlers.
   `executed` only means the commands were handed to the engine or the plugin's
   shared special-action entry; ordinary `ExecuteClientCmd` has no generic
   success signal.
-- Plugin → `debug_demo_state` with `{session_id, demo_path, playing, tick}`.
-  Sent on playback start/stop, an observed path change, or confirmation of an
-  explicit replay, including requests without draft commands. Paths describe
-  observed playback; queuing `playdemo` does not relabel the previous Demo.
-  It does not end the debug game or re-issue playback after a reconnect.
+- Plugin → `debug_demo_state` with `{session_id, demo_path, playing, paused}`.
+  Sent on playback start/stop, an engine pause/resume change, an observed path
+  change, or confirmation of an explicit replay, including requests without
+  draft commands. `paused` is read from the loaded Demo on the game thread; it
+  is never inferred from tick growth or from the command strings the host
+  sent. Paths describe observed playback; queuing `playdemo` does not relabel
+  the previous Demo. The message carries no tick: the internal tick is still
+  used for replay confirmation only. It does not end the debug game or re-issue
+  playback after a reconnect.
 
 Plugin special actions such as `csdm_radar_pov 0/1` are intercepted by the same
 shared entry used by the automatic JSON sequence path. A failed special action
@@ -110,19 +116,25 @@ Output:
 
 - `static/cs2/server.dll`
 
-Run the portable playback-confirmation regression checks from a Visual Studio
-Developer PowerShell (the test does not load CS2):
+Run the portable playback-confirmation and debug-protocol regression checks
+from a Visual Studio Developer PowerShell (the tests do not load CS2):
 
 ```powershell
 cl /nologo /EHsc /W4 /WX tests/debug_playback_test.cpp "/Fo:$env:TEMP/csdm-debug-playback-test.obj" "/Fe:$env:TEMP/csdm-debug-playback-test.exe"
 if ($LASTEXITCODE -ne 0) { throw "Playback regression test build failed" }
 & "$env:TEMP/csdm-debug-playback-test.exe"
 if ($LASTEXITCODE -ne 0) { throw "Playback regression test failed" }
+
+cl /nologo /EHsc /W4 /WX /Ics2-server-plugin/deps/json/include tests/debug_protocol_test.cpp cs2-server-plugin/record_status_bridge.cpp "/Fo:$env:TEMP/" "/Fe:$env:TEMP/csdm-debug-protocol-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Debug protocol test build failed" }
+& "$env:TEMP/csdm-debug-protocol-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Debug protocol test failed" }
 ```
 
-The same test can be compiled with `clang++ -std=c++14` on macOS/Linux. These
-checks cover path/replay confirmation; actual engine path reporting and command
-application timing still require Windows HLAE/CS2 validation.
+The same tests can be compiled with `clang++ -std=c++14` on macOS/Linux. These
+checks cover path/replay confirmation and the `debug_demo_state` wire format;
+actual engine path reporting, engine pause observation and command application
+timing still require Windows HLAE/CS2 validation.
 
 ## Release automation
 
