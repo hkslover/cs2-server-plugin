@@ -122,3 +122,20 @@ nlohmann::json BuildDebugCommandResultMessage(
     msg["payload"] = payload;
     return msg;
 }
+
+nlohmann::json BuildDebugDemoStateMessage(
+    const std::string& sessionID,
+    const std::string& demoPath,
+    bool playing,
+    int tick)
+{
+    nlohmann::json msg;
+    msg["name"] = "debug_demo_state";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"demo_path", demoPath},
+        {"playing", playing},
+        {"tick", tick},
+    };
+    return msg;
+}

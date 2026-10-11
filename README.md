@@ -23,7 +23,7 @@ When launched by CS2 Highlight Tool, the host supplies the following optional en
 
 - `CSDM_WS_PORT`: loopback WebSocket port for production control. If absent or invalid, the plugin keeps the standalone compatibility default of `4574`.
 - `CSDM_LOG_PATH`: absolute path for the plugin diagnostic log. If absent, or if that path cannot be opened, the plugin falls back to `csdm.log` in its working directory.
-- `CSDM_DEBUG_SESSION`: non-empty session id for the interactive debug workbench. Only when this is set does the plugin accept `debug_execute`; formal production launches omit it.
+- `CSDM_DEBUG_SESSION`: non-empty session id for the interactive debug workbench. Only when this is set does the plugin accept `debug_execute` and `debug_play_demo`; formal production launches omit it. Debug playback ignores Demo sequence files entirely.
 
 All `easywsclient` access is owned by the plugin's WebSocket thread. Other game/plugin threads enqueue bounded outbound events; `record_status`, `demo_started`, and `demo_done` are retained briefly and replayed on reconnect, while the generic `status` acknowledgement is intentionally never replayed.
 
@@ -57,12 +57,28 @@ completion handlers.
   one console command; a custom input keeps its semicolons and quotes inside a
   single element. The plugin trims whitespace and executes the commands in order
   on the game thread.
+- Host → `debug_play_demo` with `{request_id, demo_path, commands?: [string]}`.
+  Handled on the game thread: any queued sequences are cleared, the Demo is
+  loaded with a quoted `playdemo "<demo_path>"`, and the optional draft commands
+  are applied once the Demo can actually accept them. It never reads, writes or
+  deletes `<demo>.json`; the `playdemo` production branch and the `+playdemo`
+  launch option are likewise ignored while `CSDM_DEBUG_SESSION` is set. Plugin
+  special actions in `commands` (for example `csdm_radar_pov 1`) are initialized
+  immediately; ordinary Demo-dependent commands are deferred until the engine
+  reports playback of the requested full path. Advancing ticks in the previous
+  Demo do not consume these commands. Replaying the same file also requires an
+  observed stop/start or tick rewind before applying them once.
 - Plugin → `debug_command_result` with
   `{request_id, status: "executed"|"failed", error?}`. Sent after the game
   thread processed the whole request, not when the WebSocket received it.
   `executed` only means the commands were handed to the engine or the plugin's
   shared special-action entry; ordinary `ExecuteClientCmd` has no generic
   success signal.
+- Plugin → `debug_demo_state` with `{session_id, demo_path, playing, tick}`.
+  Sent on playback start/stop, an observed path change, or confirmation of an
+  explicit replay, including requests without draft commands. Paths describe
+  observed playback; queuing `playdemo` does not relabel the previous Demo.
+  It does not end the debug game or re-issue playback after a reconnect.
 
 Plugin special actions such as `csdm_radar_pov 0/1` are intercepted by the same
 shared entry used by the automatic JSON sequence path. A failed special action
@@ -93,6 +109,20 @@ msbuild /m /p:Configuration=Release /p:Platform=x64 cs2-server-plugin.sln
 Output:
 
 - `static/cs2/server.dll`
+
+Run the portable playback-confirmation regression checks from a Visual Studio
+Developer PowerShell (the test does not load CS2):
+
+```powershell
+cl /nologo /EHsc /W4 /WX tests/debug_playback_test.cpp "/Fo:$env:TEMP/csdm-debug-playback-test.obj" "/Fe:$env:TEMP/csdm-debug-playback-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Playback regression test build failed" }
+& "$env:TEMP/csdm-debug-playback-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Playback regression test failed" }
+```
+
+The same test can be compiled with `clang++ -std=c++14` on macOS/Linux. These
+checks cover path/replay confirmation; actual engine path reporting and command
+application timing still require Windows HLAE/CS2 validation.
 
 ## Release automation
 

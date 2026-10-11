@@ -28,3 +28,8 @@ nlohmann::json BuildDebugCommandResultMessage(
     const std::string& requestID,
     const std::string& status,
     const std::string& error);
+nlohmann::json BuildDebugDemoStateMessage(
+    const std::string& sessionID,
+    const std::string& demoPath,
+    bool playing,
+    int tick);

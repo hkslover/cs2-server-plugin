@@ -153,6 +153,7 @@ del *.pdb</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="cdll_interfaces.h" />
+    <ClInclude Include="debug_playback.h" />
     <ClInclude Include="cs2_cvar_access.h" />
     <ClInclude Include="deps\minhook\include\MinHook.h" />
     <ClInclude Include="mem_utils.h" />
