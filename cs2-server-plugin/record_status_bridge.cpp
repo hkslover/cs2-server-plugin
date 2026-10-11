@@ -94,3 +94,31 @@ nlohmann::json BuildSessionExitAckMessage(const std::string& requestID) {
     };
     return msg;
 }
+
+nlohmann::json BuildDebugSessionReadyMessage(const std::string& sessionID, int protocolVersion) {
+    nlohmann::json msg;
+    msg["name"] = "debug_session_ready";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"protocol_version", protocolVersion},
+    };
+    return msg;
+}
+
+nlohmann::json BuildDebugCommandResultMessage(
+    const std::string& requestID,
+    const std::string& status,
+    const std::string& error)
+{
+    nlohmann::json payload;
+    payload["request_id"] = requestID;
+    payload["status"] = status;
+    if (!error.empty()) {
+        payload["error"] = error;
+    }
+
+    nlohmann::json msg;
+    msg["name"] = "debug_command_result";
+    msg["payload"] = payload;
+    return msg;
+}

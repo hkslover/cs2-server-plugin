@@ -23,6 +23,7 @@ When launched by CS2 Highlight Tool, the host supplies the following optional en
 
 - `CSDM_WS_PORT`: loopback WebSocket port for production control. If absent or invalid, the plugin keeps the standalone compatibility default of `4574`.
 - `CSDM_LOG_PATH`: absolute path for the plugin diagnostic log. If absent, or if that path cannot be opened, the plugin falls back to `csdm.log` in its working directory.
+- `CSDM_DEBUG_SESSION`: non-empty session id for the interactive debug workbench. Only when this is set does the plugin accept `debug_execute`; formal production launches omit it.
 
 All `easywsclient` access is owned by the plugin's WebSocket thread. Other game/plugin threads enqueue bounded outbound events; `record_status`, `demo_started`, and `demo_done` are retained briefly and replayed on reconnect, while the generic `status` acknowledgement is intentionally never replayed.
 
@@ -32,6 +33,43 @@ After the host has completed a successful production queue, it may send
 thread, then queues CS2's `quit` command on the game thread. This acknowledgement
 is intentionally not replayed after reconnect; hosts without this protocol fall
 back to their PID-close path.
+
+## Interactive debug protocol
+
+Only active when `CSDM_DEBUG_SESSION` is non-empty. These messages are separate
+from the production queue protocol and never touch the queue acknowledgement or
+completion handlers.
+
+- Plugin → `debug_session_ready` with `{session_id, protocol_version: 1}`. Sent
+  once the WebSocket connection is open and the game-thread frame hook has
+  resolved the engine and reached the command-consumption path,
+  and resent on every reconnect. It does not mean a Demo is playing.
+- The `FrameStageNotify` command hook is installed as soon as the client
+  interface is available. Plugin `Connect` attempts installation; in debug
+  mode a separate bootstrap worker retries every 100 ms until it succeeds or
+  shutdown begins, without waiting for `ClientFullyConnect`. The worker only
+  resolves the client interface and installs the hook. Engine lookup, readiness,
+  and command execution stay on the game thread; WebSocket access stays on the
+  WebSocket thread. Shutdown joins the bootstrap worker before engine teardown.
+  `ClientFullyConnect` retains the production fallback. If the engine appears
+  later, the frame hook retries lookup before announcing ready.
+- Host → `debug_execute` with `{request_id, commands: [string]}`. Each element is
+  one console command; a custom input keeps its semicolons and quotes inside a
+  single element. The plugin trims whitespace and executes the commands in order
+  on the game thread.
+- Plugin → `debug_command_result` with
+  `{request_id, status: "executed"|"failed", error?}`. Sent after the game
+  thread processed the whole request, not when the WebSocket received it.
+  `executed` only means the commands were handed to the engine or the plugin's
+  shared special-action entry; ordinary `ExecuteClientCmd` has no generic
+  success signal.
+
+Plugin special actions such as `csdm_radar_pov 0/1` are intercepted by the same
+shared entry used by the automatic JSON sequence path. A failed special action
+(for example a Radar POV hook install failure) is reported as `failed` with an
+error instead of a silent success. A special action must be sent on its own: a
+semicolon chain that starts with one is handed to the engine as a whole so no
+trailing command is silently dropped.
 
 ## Build (Windows)
 

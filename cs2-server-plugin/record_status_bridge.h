@@ -21,3 +21,10 @@ nlohmann::json BuildRecordStatusMessage(
 nlohmann::json BuildDemoStartedMessage(const std::string& demoPath);
 nlohmann::json BuildDemoDoneMessage(const std::string& demoPath, const std::string& reason);
 nlohmann::json BuildSessionExitAckMessage(const std::string& requestID);
+
+// Interactive debug protocol messages (only used when CSDM_DEBUG_SESSION is set).
+nlohmann::json BuildDebugSessionReadyMessage(const std::string& sessionID, int protocolVersion);
+nlohmann::json BuildDebugCommandResultMessage(
+    const std::string& requestID,
+    const std::string& status,
+    const std::string& error);
