@@ -430,6 +430,8 @@ static bool TryHandlePluginSpecialCommand(const std::string& cmd, std::string& o
     return true;
 }
 
+void SendMsg(const json& msg);
+
 // Apply the deferred debug playback commands once, on the game thread, at the
 // moment the Demo can actually accept them. Plugin special actions were already
 // initialized when the play request was handled. The caller must first confirm
