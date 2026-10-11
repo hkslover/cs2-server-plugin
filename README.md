@@ -23,7 +23,7 @@ When launched by CS2 Highlight Tool, the host supplies the following optional en
 
 - `CSDM_WS_PORT`: loopback WebSocket port for production control. If absent or invalid, the plugin keeps the standalone compatibility default of `4574`.
 - `CSDM_LOG_PATH`: absolute path for the plugin diagnostic log. If absent, or if that path cannot be opened, the plugin falls back to `csdm.log` in its working directory.
-- `CSDM_DEBUG_SESSION`: non-empty session id for the interactive debug workbench. Only when this is set does the plugin accept `debug_execute` and `debug_play_demo`; formal production launches omit it. Debug playback ignores Demo sequence files entirely.
+- `CSDM_DEBUG_SESSION`: non-empty session id for the interactive debug workbench. Only when this is set does the plugin accept `debug_execute`, `debug_play_demo`, `debug_record_start` and `debug_record_stop`; formal production launches omit it. Debug playback ignores Demo sequence files entirely.
 
 All `easywsclient` access is owned by the plugin's WebSocket thread. Other game/plugin threads enqueue bounded outbound events; `record_status`, `demo_started`, and `demo_done` are retained briefly and replayed on reconnect, while the generic `status` acknowledgement is intentionally never replayed.
 
@@ -85,6 +85,28 @@ completion handlers.
   the previous Demo. The message carries no tick: the internal tick is still
   used for replay confirmation only. It does not end the debug game or re-issue
   playback after a reconnect.
+- Host → `debug_record_start` with
+  `{request_id, recording_id, demo_path, take_name, commands: [string]}`. The
+  game thread runs the ordered recording initialization commands and the final
+  `mirv_streams record start`, then answers once. The commands come from the
+  host's shared recording helper, so the FFmpeg settings entry, FPS, output
+  name and 4:3 real-pixel stretch stay identical to formal production. The
+  plugin keeps one small active-recording record keyed by `recording_id`; it
+  never depends on Demo tick changes, so recording keeps working while playback
+  is paused and never enqueues a quit or disconnect.
+- Host → `debug_record_stop` with `{request_id, recording_id}`. The game thread
+  ends only the matching active segment with `mirv_streams record end`. A
+  recording id that does not match the active record is answered with `failed`
+  instead of ending an unrelated segment.
+- Plugin → `debug_record_status` with
+  `{session_id, recording_id, demo_path, take_name, record_phase, tick, ts_ms}`.
+  Sent by the game thread immediately after the real
+  `mirv_streams record start`/`end` command ran, so the host only switches to
+  `recording`/`merging` on an actual boundary; the boundary receipt alone is
+  not proof a file exists. `record_phase` is `start` or `end` and is correlated
+  with the host-issued recording id. Unlike the production `record_status`,
+  this message never carries `take_index` and never enters the take/history
+  pipeline, and it is not replayed after a reconnect.
 
 Plugin special actions such as `csdm_radar_pov 0/1` are intercepted by the same
 shared entry used by the automatic JSON sequence path. A failed special action

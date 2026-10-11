@@ -125,6 +125,15 @@ struct PendingEngineCommand {
     bool debugPlayDemo = false;
     std::string debugPlayDemoPath;
     std::vector<std::string> debugPlayDemoCommands;
+    // Manual debug recording boundaries. Start carries the full ordered
+    // command list (initialization and the final start); stop carries only the
+    // recording id and lets the game thread issue the end command itself.
+    bool debugRecordStart = false;
+    bool debugRecordStop = false;
+    std::string debugRecordID;
+    std::string debugRecordDemoPath;
+    std::string debugRecordTakeName;
+    std::vector<std::string> debugRecordCommands;
 };
 std::mutex pendingCommandsMutex;
 std::queue<PendingEngineCommand> pendingCommands;
@@ -342,6 +351,16 @@ void QueueDebugCommands(const std::string& requestID, std::vector<std::string> c
     pendingCommands.push(std::move(item));
 }
 
+// Active manual debug recording. Only the game thread mutates it while it
+// handles debug_record_start / debug_record_stop; it never depends on Demo tick
+// changes, so start/stop keep working while playback is paused.
+struct DebugRecordingState {
+    std::string recordingID;
+    std::string demoPath;
+    std::string takeName;
+};
+DebugRecordingState activeDebugRecording;
+
 // Enqueue one interactive debug playback request. The game thread clears any
 // queued sequences, loads the Demo and answers once; the WebSocket thread never
 // calls the engine and never acknowledges before execution.
@@ -352,6 +371,37 @@ void QueueDebugPlayDemo(const std::string& requestID, const std::string& demoPat
     item.debugRequestID = requestID;
     item.debugPlayDemoPath = demoPath;
     item.debugPlayDemoCommands = std::move(commands);
+    pendingCommands.push(std::move(item));
+}
+
+// Enqueue one manual debug recording start. The game thread runs the ordered
+// initialization commands and answers only after the recording boundary ran.
+void QueueDebugRecordStart(
+    const std::string& requestID,
+    const std::string& recordingID,
+    const std::string& demoPath,
+    const std::string& takeName,
+    std::vector<std::string> commands)
+{
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugRecordStart = true;
+    item.debugRequestID = requestID;
+    item.debugRecordID = recordingID;
+    item.debugRecordDemoPath = demoPath;
+    item.debugRecordTakeName = takeName;
+    item.debugRecordCommands = std::move(commands);
+    pendingCommands.push(std::move(item));
+}
+
+// Enqueue one manual debug recording stop. The game thread ends the recording
+// segment without quitting or disconnecting the game.
+void QueueDebugRecordStop(const std::string& requestID, const std::string& recordingID) {
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugRecordStop = true;
+    item.debugRequestID = requestID;
+    item.debugRecordID = recordingID;
     pendingCommands.push(std::move(item));
 }
 
@@ -508,6 +558,95 @@ static void HandleDebugPlayDemoOnGameThread(ISource2EngineToClient* engine, Pend
         firstError));
 }
 
+// Handle one debug_record_start request on the game thread: run the ordered
+// recording initialization commands and report the boundary only after the
+// real `mirv_streams record start` ran. The active recording record is kept so
+// a later stop can only end the segment it belongs to.
+static void HandleDebugRecordStartOnGameThread(ISource2EngineToClient* engine, PendingEngineCommand& item)
+{
+    // One manual segment at a time: a duplicate start must not silently
+    // orphan the segment that is already recording.
+    if (!activeDebugRecording.recordingID.empty()) {
+        Log("Ignoring debug_record_start while recording id=%s is active", activeDebugRecording.recordingID.c_str());
+        SendMsg(BuildDebugCommandResultMessage(
+            item.debugRequestID,
+            "failed",
+            "已有调试录制正在进行"));
+        return;
+    }
+
+    activeDebugRecording.recordingID = item.debugRecordID;
+    activeDebugRecording.demoPath = item.debugRecordDemoPath;
+    activeDebugRecording.takeName = item.debugRecordTakeName;
+
+    std::string firstError;
+    for (auto& rawCmd : item.debugRecordCommands) {
+        const std::string cmd = TrimWhitespace(rawCmd);
+        if (cmd.empty()) {
+            if (firstError.empty()) {
+                firstError = "命令为空";
+            }
+            continue;
+        }
+        std::string specialError;
+        if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+            Log("Handled debug record special command: %s", cmd.c_str());
+            if (!specialError.empty() && firstError.empty()) {
+                firstError = specialError;
+            }
+        } else {
+            Log("Executing debug record command: %s", cmd.c_str());
+            engine->ExecuteClientCmd(0, cmd.c_str(), true);
+            Log("Executed debug record command: %s", cmd.c_str());
+        }
+        // The observation is sent after the real boundary command ran; the
+        // receipt below only proves the game thread processed the request.
+        if (IsMirvRecordBoundaryCommand(cmd)) {
+            SendMsg(BuildDebugRecordStatusMessage(
+                debugSessionID,
+                item.debugRecordID,
+                item.debugRecordDemoPath,
+                item.debugRecordTakeName,
+                "start",
+                currentTick.load()));
+        }
+    }
+    SendMsg(BuildDebugCommandResultMessage(
+        item.debugRequestID,
+        firstError.empty() ? "executed" : "failed",
+        firstError));
+}
+
+// Handle one debug_record_stop request on the game thread. It only ends the
+// active segment that matches the requested recording id, never quits or
+// disconnects, and answers after the end boundary ran.
+static void HandleDebugRecordStopOnGameThread(ISource2EngineToClient* engine, PendingEngineCommand& item)
+{
+    if (activeDebugRecording.recordingID.empty() || activeDebugRecording.recordingID != item.debugRecordID) {
+        Log("Ignoring debug_record_stop for unknown recording id=%s", item.debugRecordID.c_str());
+        SendMsg(BuildDebugCommandResultMessage(
+            item.debugRequestID,
+            "failed",
+            "没有匹配的调试录制"));
+        return;
+    }
+
+    const std::string cmd = "mirv_streams record end";
+    Log("Executing debug record stop: %s", cmd.c_str());
+    engine->ExecuteClientCmd(0, cmd.c_str(), true);
+    Log("Executed debug record stop: %s", cmd.c_str());
+
+    SendMsg(BuildDebugRecordStatusMessage(
+        debugSessionID,
+        activeDebugRecording.recordingID,
+        activeDebugRecording.demoPath,
+        activeDebugRecording.takeName,
+        "end",
+        currentTick.load()));
+    activeDebugRecording = DebugRecordingState{};
+    SendMsg(BuildDebugCommandResultMessage(item.debugRequestID, "executed", ""));
+}
+
 ISource2EngineToClient* GetEngine()
 {
     if (engineToClient != NULL) {
@@ -533,7 +672,7 @@ int GetWebSocketMessagePriority(const std::string& name)
 {
     if (name == "demo_done" || name == "session_exit_ack" ||
         name == "debug_session_ready" || name == "debug_command_result" ||
-        name == "debug_demo_state") {
+        name == "debug_demo_state" || name == "debug_record_status") {
         return 2;
     }
     if (name == "record_status" || name == "demo_started") {
@@ -799,6 +938,14 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
         for (auto& item : queued) {
             if (item.debugPlayDemo) {
                 HandleDebugPlayDemoOnGameThread(engine, item);
+                continue;
+            }
+            if (item.debugRecordStart) {
+                HandleDebugRecordStartOnGameThread(engine, item);
+                continue;
+            }
+            if (item.debugRecordStop) {
+                HandleDebugRecordStopOnGameThread(engine, item);
                 continue;
             }
             if (item.debugBatch) {
@@ -1155,6 +1302,70 @@ void HandleWebSocketMessage(const std::string& message)
             }
             Log("Accepted debug_execute request id=%s commands=%zu", requestID.c_str(), commands.size());
             QueueDebugCommands(requestID, std::move(commands));
+        }
+        else if (name == "debug_record_start") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_record_start without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_record_start command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("recording_id") || !payload["recording_id"].is_string() ||
+                !payload.contains("demo_path") || !payload["demo_path"].is_string() ||
+                !payload.contains("take_name") || !payload["take_name"].is_string() ||
+                !payload.contains("commands") || !payload["commands"].is_array()) {
+                Log("Ignoring debug_record_start command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            std::string recordingID = payload["recording_id"];
+            std::string demoPath = payload["demo_path"];
+            std::string takeName = payload["take_name"];
+            if (requestID.empty() || recordingID.empty()) {
+                Log("Ignoring debug_record_start command with empty request_id or recording_id");
+                return;
+            }
+            std::vector<std::string> commands;
+            for (const auto& entry : payload["commands"]) {
+                if (entry.is_string()) {
+                    commands.push_back(entry.get<std::string>());
+                }
+            }
+            Log("Accepted debug_record_start request id=%s recording=%s commands=%zu",
+                requestID.c_str(), recordingID.c_str(), commands.size());
+            QueueDebugRecordStart(requestID, recordingID, demoPath, takeName, std::move(commands));
+        }
+        else if (name == "debug_record_stop") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_record_stop without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_record_stop command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("recording_id") || !payload["recording_id"].is_string()) {
+                Log("Ignoring debug_record_stop command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            std::string recordingID = payload["recording_id"];
+            if (requestID.empty() || recordingID.empty()) {
+                Log("Ignoring debug_record_stop command with empty request_id or recording_id");
+                return;
+            }
+            Log("Accepted debug_record_stop request id=%s recording=%s", requestID.c_str(), recordingID.c_str());
+            QueueDebugRecordStop(requestID, recordingID);
         }
         else {
             Log("Ignoring unknown WebSocket command: %s", name.c_str());

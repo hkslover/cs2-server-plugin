@@ -139,3 +139,25 @@ nlohmann::json BuildDebugDemoStateMessage(
     };
     return msg;
 }
+
+nlohmann::json BuildDebugRecordStatusMessage(
+    const std::string& sessionID,
+    const std::string& recordingID,
+    const std::string& demoPath,
+    const std::string& takeName,
+    const std::string& recordPhase,
+    int tick)
+{
+    nlohmann::json msg;
+    msg["name"] = "debug_record_status";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"recording_id", recordingID},
+        {"demo_path", demoPath},
+        {"take_name", takeName},
+        {"record_phase", recordPhase},
+        {"tick", tick},
+        {"ts_ms", GetUnixTimestampMs()},
+    };
+    return msg;
+}

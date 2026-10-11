@@ -36,3 +36,14 @@ nlohmann::json BuildDebugDemoStateMessage(
     const std::string& demoPath,
     bool playing,
     bool paused);
+// Manual debug recording boundary observation. It is emitted by the game
+// thread right after the real `mirv_streams record start`/`end` command ran,
+// and never enters the produce `record_status` take/history path. `recordPhase`
+// is "start" or "end"; the desktop correlates it with the recording id it sent.
+nlohmann::json BuildDebugRecordStatusMessage(
+    const std::string& sessionID,
+    const std::string& recordingID,
+    const std::string& demoPath,
+    const std::string& takeName,
+    const std::string& recordPhase,
+    int tick);
