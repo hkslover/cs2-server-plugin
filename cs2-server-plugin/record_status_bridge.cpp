@@ -94,3 +94,70 @@ nlohmann::json BuildSessionExitAckMessage(const std::string& requestID) {
     };
     return msg;
 }
+
+nlohmann::json BuildDebugSessionReadyMessage(const std::string& sessionID, int protocolVersion) {
+    nlohmann::json msg;
+    msg["name"] = "debug_session_ready";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"protocol_version", protocolVersion},
+    };
+    return msg;
+}
+
+nlohmann::json BuildDebugCommandResultMessage(
+    const std::string& requestID,
+    const std::string& status,
+    const std::string& error)
+{
+    nlohmann::json payload;
+    payload["request_id"] = requestID;
+    payload["status"] = status;
+    if (!error.empty()) {
+        payload["error"] = error;
+    }
+
+    nlohmann::json msg;
+    msg["name"] = "debug_command_result";
+    msg["payload"] = payload;
+    return msg;
+}
+
+nlohmann::json BuildDebugDemoStateMessage(
+    const std::string& sessionID,
+    const std::string& demoPath,
+    bool playing,
+    bool paused)
+{
+    nlohmann::json msg;
+    msg["name"] = "debug_demo_state";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"demo_path", demoPath},
+        {"playing", playing},
+        {"paused", paused},
+    };
+    return msg;
+}
+
+nlohmann::json BuildDebugRecordStatusMessage(
+    const std::string& sessionID,
+    const std::string& recordingID,
+    const std::string& demoPath,
+    const std::string& takeName,
+    const std::string& recordPhase,
+    int tick)
+{
+    nlohmann::json msg;
+    msg["name"] = "debug_record_status";
+    msg["payload"] = {
+        {"session_id", sessionID},
+        {"recording_id", recordingID},
+        {"demo_path", demoPath},
+        {"take_name", takeName},
+        {"record_phase", recordPhase},
+        {"tick", tick},
+        {"ts_ms", GetUnixTimestampMs()},
+    };
+    return msg;
+}

@@ -24,6 +24,9 @@
     <ClInclude Include="cdll_interfaces.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="debug_playback.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="cs2_cvar_access.h">
       <Filter>Header Files</Filter>
     </ClInclude>

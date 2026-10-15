@@ -10,12 +10,14 @@
 #include <sstream>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include <easywsclient.hpp>
 #include "icvar.h"
 #include "cs2_cvar_access.h"
 #include "cdll_interfaces.h"
+#include "debug_playback.h"
 #include "record_status_bridge.h"
 #include "radar_pov.h"
 #ifdef _WIN32
@@ -89,11 +91,16 @@ ISource2Client* client = NULL;
 FrameStageNotifyFn originalFrameStageNotify = NULL;
 ICvar* g_pCVar = NULL;
 std::thread* wsConnectionThread = NULL;
+std::thread* debugBootstrapThread = NULL;
 string gameInfoPath;
 string gameInfoBackupPath;
 const char* demoPath = NULL;
 std::string activeDemoPath;
 bool isPlayingDemo = false;
+// Engine pause observation for the debug workbench. Only the game thread
+// writes/reads it; the debug host treats it as playback state, not a session
+// status. Kept alongside isPlayingDemo so the frame hook can detect changes.
+bool isDemoPaused = false;
 std::atomic<int> currentTick{-1};
 std::atomic<bool> isQuitting{false};
 bool shouldDeleteLogFile = true;
@@ -102,10 +109,58 @@ std::string logFilePath;
 bool logFilePathInitialized = false;
 std::mutex sequencesMutex;
 std::queue<Sequence> sequences;
+
+// One unit of work for the game thread. Ordinary console commands keep using
+// the string wrapper, while an interactive debug request carries its own
+// request id and the full ordered command list so the game thread can answer
+// only after every command was processed.
+struct PendingEngineCommand {
+    std::string cmd;
+    bool debugBatch = false;
+    std::string debugRequestID;
+    std::vector<std::string> debugCommands;
+    // debug_play_demo is a debug-only unit: clear any queued sequences, load
+    // the Demo, and apply deferred draft commands after target playback is
+    // confirmed. It never touches the Demo's produce sequence file.
+    bool debugPlayDemo = false;
+    std::string debugPlayDemoPath;
+    std::vector<std::string> debugPlayDemoCommands;
+    // Manual debug recording boundaries. Start carries the full ordered
+    // command list (initialization and the final start); stop carries only the
+    // recording id and lets the game thread issue the end command itself.
+    bool debugRecordStart = false;
+    bool debugRecordStop = false;
+    std::string debugRecordID;
+    std::string debugRecordDemoPath;
+    std::string debugRecordTakeName;
+    std::vector<std::string> debugRecordCommands;
+};
 std::mutex pendingCommandsMutex;
-std::queue<std::string> pendingCommands;
+std::queue<PendingEngineCommand> pendingCommands;
 std::atomic<bool> wsConnected{false};
 std::atomic<bool> exitAfterWebSocketAck{false};
+
+// Interactive debug protocol gate. Empty unless the host launched this game
+// with CSDM_DEBUG_SESSION, which keeps formal production behavior unchanged.
+std::string debugSessionID;
+// Version 2 changed the playback observation to `{session_id, demo_path,
+// playing, paused}`: the current-tick field was removed and engine pause
+// reporting was added. The host rejects older DLLs so a missing pause field is
+// never shown as a working pause button.
+const int DEBUG_PROTOCOL_VERSION = 2;
+// Deferred debug playback commands (the debug-draft game settings) applied once
+// on the game thread when the requested Demo's playback is confirmed. Plugin special
+// actions are initialized when the play request is handled, so only ordinary
+// Demo-dependent commands stay here. All access is on the game thread.
+DebugPlaybackGate debugPlaybackGate;
+std::vector<std::string> debugPendingPlaybackCommands;
+// Published by the game thread only after the frame hook can resolve the engine
+// and consume commands. Interface lookup alone is not proof of a live consumer.
+std::atomic<bool> engineCommandReady{false};
+// Guards one-time installation of the FrameStageNotify hook and the
+// ClientFullyConnect initialization.
+std::mutex clientHookMutex;
+std::atomic<bool> clientFullyConnectInitialized{false};
 
 struct OutboundWebSocketMessage {
     std::string payload;
@@ -279,7 +334,75 @@ void PatchVTableEntry(void** vtable, int index, void* newFunc) {
 
 void QueueEngineCommand(const std::string& cmd) {
     std::lock_guard<std::mutex> lock(pendingCommandsMutex);
-    pendingCommands.push(cmd);
+    PendingEngineCommand item;
+    item.cmd = cmd;
+    pendingCommands.push(item);
+}
+
+// Enqueue one interactive debug request. The whole command list is processed on
+// the game thread and answered once; the WebSocket thread never calls the
+// engine and never acknowledges before execution.
+void QueueDebugCommands(const std::string& requestID, std::vector<std::string> commands) {
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugBatch = true;
+    item.debugRequestID = requestID;
+    item.debugCommands = std::move(commands);
+    pendingCommands.push(std::move(item));
+}
+
+// Active manual debug recording. Only the game thread mutates it while it
+// handles debug_record_start / debug_record_stop; it never depends on Demo tick
+// changes, so start/stop keep working while playback is paused.
+struct DebugRecordingState {
+    std::string recordingID;
+    std::string demoPath;
+    std::string takeName;
+};
+DebugRecordingState activeDebugRecording;
+
+// Enqueue one interactive debug playback request. The game thread clears any
+// queued sequences, loads the Demo and answers once; the WebSocket thread never
+// calls the engine and never acknowledges before execution.
+void QueueDebugPlayDemo(const std::string& requestID, const std::string& demoPath, std::vector<std::string> commands) {
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugPlayDemo = true;
+    item.debugRequestID = requestID;
+    item.debugPlayDemoPath = demoPath;
+    item.debugPlayDemoCommands = std::move(commands);
+    pendingCommands.push(std::move(item));
+}
+
+// Enqueue one manual debug recording start. The game thread runs the ordered
+// initialization commands and answers only after the recording boundary ran.
+void QueueDebugRecordStart(
+    const std::string& requestID,
+    const std::string& recordingID,
+    const std::string& demoPath,
+    const std::string& takeName,
+    std::vector<std::string> commands)
+{
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugRecordStart = true;
+    item.debugRequestID = requestID;
+    item.debugRecordID = recordingID;
+    item.debugRecordDemoPath = demoPath;
+    item.debugRecordTakeName = takeName;
+    item.debugRecordCommands = std::move(commands);
+    pendingCommands.push(std::move(item));
+}
+
+// Enqueue one manual debug recording stop. The game thread ends the recording
+// segment without quitting or disconnecting the game.
+void QueueDebugRecordStop(const std::string& requestID, const std::string& recordingID) {
+    std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+    PendingEngineCommand item;
+    item.debugRecordStop = true;
+    item.debugRequestID = requestID;
+    item.debugRecordID = recordingID;
+    pendingCommands.push(std::move(item));
 }
 
 static void QueueEngineCommandCStr(const char* cmd) {
@@ -288,14 +411,36 @@ static void QueueEngineCommandCStr(const char* cmd) {
     }
 }
 
-// Sequence JSON special action (same path as pause_playback / go_to_next_sequence).
-// Accepts: "csdm_radar_pov" or "csdm_radar_pov 1". Idempotent: never re-installs hooks.
-// Returns true if cmd was handled here (do not send to engine).
-static bool TryHandleRadarPovSequenceCmd(const string& cmd)
+static std::string TrimWhitespace(const std::string& value) {
+    const char* whitespace = " \t\r\n";
+    std::size_t start = value.find_first_not_of(whitespace);
+    if (start == std::string::npos) {
+        return std::string();
+    }
+    std::size_t end = value.find_last_not_of(whitespace);
+    return value.substr(start, end - start + 1);
+}
+
+// Shared entry for plugin special actions. The automatic JSON sequence path and
+// queued debug commands both call it, and anything it does not handle is sent
+// to the engine as-is. `csdm_radar_pov` is not a registered cvar, so it must be
+// intercepted here rather than forwarded to ExecuteClientCmd.
+//
+// Returns true when cmd is a plugin special command (handled or failed) and
+// must not go to the engine. On failure outError is non-empty.
+static bool TryHandlePluginSpecialCommand(const std::string& cmd, std::string& outError)
 {
+    outError.clear();
     static const char kRadarPovCmd[] = "csdm_radar_pov";
     static const char kRadarPovCmdPref[] = "csdm_radar_pov ";  // includes trailing space
     if (cmd != kRadarPovCmd && cmd.rfind(kRadarPovCmdPref, 0) != 0) {
+        return false;
+    }
+
+    // A combined string is handed to the engine as a whole. Special actions are
+    // not console commands, so they must be sent on their own; swallowing the
+    // rest of a semicolon chain here would silently drop commands.
+    if (cmd.find(';') != std::string::npos) {
         return false;
     }
 
@@ -310,16 +455,16 @@ static bool TryHandleRadarPovSequenceCmd(const string& cmd)
 
     if (!wantEnable) {
         if (!RadarPov_IsEnabled()) {
-            Log("Radar POV: already disabled, ignoring JSON command");
+            Log("Radar POV: already disabled, ignoring command");
             return true;
         }
         RadarPov_SetEnabled(false);
-        Log("Radar POV: disabled via JSON (hooks left installed; set csdm_radar_pov to re-enable)");
+        Log("Radar POV: disabled (hooks left installed; set csdm_radar_pov to re-enable)");
         return true;
     }
 
     if (RadarPov_IsInstalled() && RadarPov_IsEnabled()) {
-        Log("Radar POV: already active, ignoring duplicate JSON command");
+        Log("Radar POV: already active, ignoring duplicate command");
         return true;
     }
 
@@ -327,18 +472,179 @@ static bool TryHandleRadarPovSequenceCmd(const string& cmd)
     RadarPov_SetEnabled(true);
 
     if (RadarPov_IsInstalled()) {
-        Log("Radar POV: hooks already installed, re-enabled via JSON");
+        Log("Radar POV: hooks already installed, re-enabled");
         return true;
     }
 
     if (RadarPov_Install()) {
         RadarPov_QueueEngineSetup(&QueueEngineCommandCStr);
-        Log("Radar POV ready from JSON (installed=%d enabled=%d)",
+        Log("Radar POV ready (installed=%d enabled=%d)",
             RadarPov_IsInstalled() ? 1 : 0, RadarPov_IsEnabled() ? 1 : 0);
-    } else {
-        Log("Radar POV: install failed from JSON command");
+        return true;
     }
+
+    outError = "Radar POV hook installation failed";
+    Log("Radar POV: install failed");
     return true;
+}
+
+void SendMsg(const json& msg);
+
+// Apply the deferred debug playback commands once, on the game thread, at the
+// moment the Demo can actually accept them. Plugin special actions were already
+// initialized when the play request was handled. The caller must first confirm
+// that the engine is playing the requested Demo through debugPlaybackGate.
+static void ApplyDebugPlaybackCommands(ISource2EngineToClient* engine)
+{
+    std::vector<std::string> commands = std::move(debugPendingPlaybackCommands);
+    debugPendingPlaybackCommands.clear();
+    for (auto& rawCmd : commands) {
+        const std::string cmd = TrimWhitespace(rawCmd);
+        if (cmd.empty()) {
+            continue;
+        }
+        std::string specialError;
+        if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+            Log("Handled deferred debug playback special command: %s", cmd.c_str());
+            continue;
+        }
+        Log("Applying deferred debug playback command: %s", cmd.c_str());
+        engine->ExecuteClientCmd(0, cmd.c_str(), true);
+    }
+}
+
+// Handle one debug_play_demo request on the game thread. It clears any queued
+// sequences (debug playback never runs a produce plan), initializes plugin
+// special actions immediately, defers ordinary draft commands until playback
+// actually starts, and issues a quoted playdemo.
+static void HandleDebugPlayDemoOnGameThread(ISource2EngineToClient* engine, PendingEngineCommand& item)
+{
+    {
+        std::lock_guard<std::mutex> lock(sequencesMutex);
+        sequences = {};
+    }
+    const char* observedPath = engine->GetDemoFilePath();
+    auto demo = engine->GetDemoFile();
+    debugPlaybackGate.Begin(item.debugPlayDemoPath,
+        observedPath ? observedPath : "", engine->IsPlayingDemo(),
+        demo ? demo->GetDemoTick() : -1);
+
+    std::vector<std::string> deferred;
+    std::string firstError;
+    for (auto& rawCmd : item.debugPlayDemoCommands) {
+        const std::string cmd = TrimWhitespace(rawCmd);
+        if (cmd.empty()) {
+            continue;
+        }
+        std::string specialError;
+        if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+            Log("Handled debug playback special command: %s", cmd.c_str());
+            if (!specialError.empty() && firstError.empty()) {
+                firstError = specialError;
+            }
+            continue;
+        }
+        deferred.push_back(cmd);
+    }
+    debugPendingPlaybackCommands = std::move(deferred);
+
+    const std::string playCmd = "playdemo \"" + item.debugPlayDemoPath + "\"";
+    Log("Debug playback: %s", playCmd.c_str());
+    engine->ExecuteClientCmd(0, playCmd.c_str(), true);
+
+    SendMsg(BuildDebugCommandResultMessage(
+        item.debugRequestID,
+        firstError.empty() ? "executed" : "failed",
+        firstError));
+}
+
+// Handle one debug_record_start request on the game thread: run the ordered
+// recording initialization commands and report the boundary only after the
+// real `mirv_streams record start` ran. The active recording record is kept so
+// a later stop can only end the segment it belongs to.
+static void HandleDebugRecordStartOnGameThread(ISource2EngineToClient* engine, PendingEngineCommand& item)
+{
+    // One manual segment at a time: a duplicate start must not silently
+    // orphan the segment that is already recording.
+    if (!activeDebugRecording.recordingID.empty()) {
+        Log("Ignoring debug_record_start while recording id=%s is active", activeDebugRecording.recordingID.c_str());
+        SendMsg(BuildDebugCommandResultMessage(
+            item.debugRequestID,
+            "failed",
+            "已有调试录制正在进行"));
+        return;
+    }
+
+    activeDebugRecording.recordingID = item.debugRecordID;
+    activeDebugRecording.demoPath = item.debugRecordDemoPath;
+    activeDebugRecording.takeName = item.debugRecordTakeName;
+
+    std::string firstError;
+    for (auto& rawCmd : item.debugRecordCommands) {
+        const std::string cmd = TrimWhitespace(rawCmd);
+        if (cmd.empty()) {
+            if (firstError.empty()) {
+                firstError = "命令为空";
+            }
+            continue;
+        }
+        std::string specialError;
+        if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+            Log("Handled debug record special command: %s", cmd.c_str());
+            if (!specialError.empty() && firstError.empty()) {
+                firstError = specialError;
+            }
+        } else {
+            Log("Executing debug record command: %s", cmd.c_str());
+            engine->ExecuteClientCmd(0, cmd.c_str(), true);
+            Log("Executed debug record command: %s", cmd.c_str());
+        }
+        // The observation is sent after the real boundary command ran; the
+        // receipt below only proves the game thread processed the request.
+        if (IsMirvRecordBoundaryCommand(cmd)) {
+            SendMsg(BuildDebugRecordStatusMessage(
+                debugSessionID,
+                item.debugRecordID,
+                item.debugRecordDemoPath,
+                item.debugRecordTakeName,
+                "start",
+                currentTick.load()));
+        }
+    }
+    SendMsg(BuildDebugCommandResultMessage(
+        item.debugRequestID,
+        firstError.empty() ? "executed" : "failed",
+        firstError));
+}
+
+// Handle one debug_record_stop request on the game thread. It only ends the
+// active segment that matches the requested recording id, never quits or
+// disconnects, and answers after the end boundary ran.
+static void HandleDebugRecordStopOnGameThread(ISource2EngineToClient* engine, PendingEngineCommand& item)
+{
+    if (activeDebugRecording.recordingID.empty() || activeDebugRecording.recordingID != item.debugRecordID) {
+        Log("Ignoring debug_record_stop for unknown recording id=%s", item.debugRecordID.c_str());
+        SendMsg(BuildDebugCommandResultMessage(
+            item.debugRequestID,
+            "failed",
+            "没有匹配的调试录制"));
+        return;
+    }
+
+    const std::string cmd = "mirv_streams record end";
+    Log("Executing debug record stop: %s", cmd.c_str());
+    engine->ExecuteClientCmd(0, cmd.c_str(), true);
+    Log("Executed debug record stop: %s", cmd.c_str());
+
+    SendMsg(BuildDebugRecordStatusMessage(
+        debugSessionID,
+        activeDebugRecording.recordingID,
+        activeDebugRecording.demoPath,
+        activeDebugRecording.takeName,
+        "end",
+        currentTick.load()));
+    activeDebugRecording = DebugRecordingState{};
+    SendMsg(BuildDebugCommandResultMessage(item.debugRequestID, "executed", ""));
 }
 
 ISource2EngineToClient* GetEngine()
@@ -358,12 +664,15 @@ ISource2EngineToClient* GetEngine()
 
 bool IsDurableWebSocketMessage(const std::string& name)
 {
-    return name == "record_status" || name == "demo_started" || name == "demo_done";
+    return name == "record_status" || name == "demo_started" || name == "demo_done" ||
+        name == "debug_demo_state";
 }
 
 int GetWebSocketMessagePriority(const std::string& name)
 {
-    if (name == "demo_done" || name == "session_exit_ack") {
+    if (name == "demo_done" || name == "session_exit_ack" ||
+        name == "debug_session_ready" || name == "debug_command_result" ||
+        name == "debug_demo_state" || name == "debug_record_status") {
         return 2;
     }
     if (name == "record_status" || name == "demo_started") {
@@ -539,6 +848,15 @@ void LoadSequencesFile(string demoPath) {
     std::lock_guard<std::mutex> lock(sequencesMutex);
     sequences = {};
 
+    // A debug session never loads a produce plan. A Demo may carry a stale
+    // sidecar, and using it would reintroduce tick skipping, automatic
+    // recording and disconnect for interactive playback. Both the `playdemo`
+    // WebSocket branch and the `+playdemo` launch option funnel through here.
+    if (!debugSessionID.empty()) {
+        Log("Debug session: ignoring sequence file for %s", demoPath.c_str());
+        return;
+    }
+
     string demoJsonPath = demoPath + ".json";
     if (FileExists(demoJsonPath)) {
         Log("Loading JSON file %s", demoJsonPath.c_str());
@@ -591,19 +909,84 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
 
     auto engine = GetEngine();
     if (engine == NULL) {
-        Log("Engine interface not found");
+        // The hook can be installed before the engine interface is available;
+        // log once instead of every rendered frame.
+        static bool loggedMissingEngine = false;
+        if (!loggedMissingEngine) {
+            loggedMissingEngine = true;
+            Log("Engine interface not found");
+        }
         originalFrameStageNotify(thisptr, stage);
         return;
     }
 
+    engineCommandReady = true;
+
     {
-        std::lock_guard<std::mutex> lock(pendingCommandsMutex);
-        while (!pendingCommands.empty()) {
-            std::string cmd = pendingCommands.front();
-            pendingCommands.pop();
+        // Drain under the lock, then execute after releasing it. A plugin
+        // special action (for example Radar POV setup) may enqueue further
+        // engine commands; executing while holding pendingCommandsMutex would
+        // deadlock the game thread.
+        std::vector<PendingEngineCommand> queued;
+        {
+            std::lock_guard<std::mutex> lock(pendingCommandsMutex);
+            while (!pendingCommands.empty()) {
+                queued.push_back(std::move(pendingCommands.front()));
+                pendingCommands.pop();
+            }
+        }
+        for (auto& item : queued) {
+            if (item.debugPlayDemo) {
+                HandleDebugPlayDemoOnGameThread(engine, item);
+                continue;
+            }
+            if (item.debugRecordStart) {
+                HandleDebugRecordStartOnGameThread(engine, item);
+                continue;
+            }
+            if (item.debugRecordStop) {
+                HandleDebugRecordStopOnGameThread(engine, item);
+                continue;
+            }
+            if (item.debugBatch) {
+                std::string firstError;
+                for (auto& rawCmd : item.debugCommands) {
+                    const std::string cmd = TrimWhitespace(rawCmd);
+                    if (cmd.empty()) {
+                        if (firstError.empty()) {
+                            firstError = "命令为空";
+                        }
+                        continue;
+                    }
+                    std::string specialError;
+                    if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+                        Log("Handled debug special command: %s", cmd.c_str());
+                        if (!specialError.empty() && firstError.empty()) {
+                            firstError = specialError;
+                        }
+                        continue;
+                    }
+                    Log("Executing debug command: %s", cmd.c_str());
+                    engine->ExecuteClientCmd(0, cmd.c_str(), true);
+                    Log("Executed debug command: %s", cmd.c_str());
+                }
+                // The receipt means the game thread processed the request, not
+                // that an ordinary console command had an observable effect.
+                SendMsg(BuildDebugCommandResultMessage(
+                    item.debugRequestID,
+                    firstError.empty() ? "executed" : "failed",
+                    firstError));
+                continue;
+            }
+            const std::string cmd = item.cmd;
             Log("Executing queued command: %s", cmd.c_str());
-            engine->ExecuteClientCmd(0, cmd.c_str(), true);
-            Log("Executed queued command: %s", cmd.c_str());
+            std::string specialError;
+            if (TryHandlePluginSpecialCommand(cmd, specialError)) {
+                Log("Handled queued special command: %s", cmd.c_str());
+            } else {
+                engine->ExecuteClientCmd(0, cmd.c_str(), true);
+                Log("Executed queued command: %s", cmd.c_str());
+            }
         }
     }
 
@@ -635,20 +1018,61 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
     }
 
     auto demo = engine->GetDemoFile();
+    if (!debugSessionID.empty()) {
+        // Observe the actual engine path, including requests while another
+        // Demo is still playing. Do not relabel its frames as the new Demo.
+        const bool playing = engine->IsPlayingDemo();
+        // The internal tick still drives replay confirmation in
+        // DebugPlaybackGate; it is never reported to the desktop.
+        const int tick = demo ? demo->GetDemoTick() : -1;
+        // Pause is an engine fact of the loaded Demo. A paused Demo stays
+        // "playing" until it is stopped or unloaded, so the two flags are
+        // reported independently and never derived from tick growth.
+        const bool paused = demo != NULL && playing && demo->IsDemoPaused();
+        const char* enginePath = engine->GetDemoFilePath();
+        const std::string observedPath = enginePath ? enginePath : "";
+        const bool confirmed = debugPlaybackGate.Observe(observedPath, playing && demo != NULL, tick);
+        const std::string previousPath = activeDemoPath;
+        if (confirmed) {
+            activeDemoPath = debugPlaybackGate.TargetPath();
+            ApplyDebugPlaybackCommands(engine);
+        } else if (playing && !observedPath.empty()) {
+            activeDemoPath = observedPath;
+        }
+        if (confirmed || playing != isPlayingDemo || paused != isDemoPaused ||
+            NormalizeDebugDemoPath(activeDemoPath) != NormalizeDebugDemoPath(previousPath)) {
+            SendMsg(BuildDebugDemoStateMessage(debugSessionID, activeDemoPath, playing, paused));
+        }
+        isPlayingDemo = playing;
+        isDemoPaused = paused;
+        currentTick = tick;
+        // Interactive playback never executes the production tick sequences.
+        // Also observe stop when the Demo file interface has disappeared.
+        originalFrameStageNotify(thisptr, stage);
+        return;
+    }
     if (demo == NULL) {
-        Log("Demo file interface not found");
+        // The hook may be installed before the client loads a map/demo, so log
+        // this once instead of every rendered frame.
+        static bool loggedMissingDemoFile = false;
+        if (!loggedMissingDemoFile) {
+            loggedMissingDemoFile = true;
+            Log("Demo file interface not found");
+        }
         originalFrameStageNotify(thisptr, stage);
         return;
     }
 
     int newTick = demo->GetDemoTick();
     bool newIsPlayingDemo = engine->IsPlayingDemo();
-    {
-        if (newIsPlayingDemo && !isPlayingDemo) {
+    if (newIsPlayingDemo && !isPlayingDemo) {
+        {
             std::lock_guard<std::mutex> lock(sequencesMutex);
             Log("[%d] Demo playback started, sequences %d", newTick, sequences.size());
         }
-        else if (!newIsPlayingDemo && isPlayingDemo) {
+    }
+    else if (!newIsPlayingDemo && isPlayingDemo) {
+        {
             std::lock_guard<std::mutex> lock(sequencesMutex);
             Log("[%d] Demo playback stopped, sequences %d", newTick, sequences.size());
         }
@@ -690,10 +1114,15 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
                     currentTick = -1;
                     break;
                 }
-                else if (TryHandleRadarPovSequenceCmd(action.cmd)) {
-                    Log("[%d] Handled sequence cmd: %s", newTick, action.cmd.c_str());
-                }
                 else {
+                    std::string specialError;
+                    if (TryHandlePluginSpecialCommand(action.cmd, specialError)) {
+                        Log("[%d] Handled sequence cmd: %s", newTick, action.cmd.c_str());
+                        if (!specialError.empty()) {
+                            Log("[%d] Sequence cmd failed: %s (%s)", newTick, action.cmd.c_str(), specialError.c_str());
+                        }
+                        continue;
+                    }
                     Log("[%d] Executing: %s", newTick, action.cmd.c_str());
                     engine->ExecuteClientCmd(0, action.cmd.c_str(), true);
                     Log("[%d] Executed: %s", newTick, action.cmd.c_str());
@@ -705,6 +1134,7 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
                         SendMsg(BuildDemoDoneMessage(activeDemoPath, "disconnect"));
                         activeDemoPath.clear();
                     }
+
                 }
             }
         }
@@ -713,6 +1143,44 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
     currentTick = newTick;
 
     originalFrameStageNotify(thisptr, stage);
+}
+
+// Install the FrameStageNotify hook as soon as the client interface is
+// available. Queued command consumption must not wait for the player to enter a
+// game, otherwise the debug workbench can never send its first `playdemo`.
+// Attempted during plugin Connect and retried by the debug bootstrap worker
+// until available; ClientFullyConnect retains the production fallback. The
+// worker only installs the hook: engine calls and readiness stay on the game
+// thread, and the WebSocket thread only transports messages.
+static bool TryInstallClientFrameHook()
+{
+    std::lock_guard<std::mutex> lock(clientHookMutex);
+    if (client != NULL) {
+        return true;
+    }
+    if (factory == NULL) {
+        return false;
+    }
+    ISource2Client* candidate = (ISource2Client*)factory("Source2Client002", NULL);
+    if (candidate == NULL) {
+        return false;
+    }
+    Log("Hooking FrameStageNotify");
+    auto vtable = *(void***)candidate;
+    originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
+    PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
+    client = candidate;
+    Log("Hooked FrameStageNotify");
+    return true;
+}
+
+static void BootstrapDebugCommandConsumer()
+{
+    // A late client interface must become usable without a map/demo connection.
+    // Stop after installation; the frame hook retries engine lookup itself.
+    while (!isQuitting && !TryInstallClientFrameHook()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 void HandleWebSocketMessage(const std::string& message)
@@ -770,6 +1238,135 @@ void HandleWebSocketMessage(const std::string& message)
             exitAfterWebSocketAck = true;
             Log("Accepted graceful session end request id=%s", requestID.c_str());
         }
+        else if (name == "debug_play_demo") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_play_demo without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_play_demo command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("demo_path") || !payload["demo_path"].is_string()) {
+                Log("Ignoring debug_play_demo command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            std::string demoPath = payload["demo_path"];
+            if (requestID.empty() || demoPath.empty()) {
+                Log("Ignoring debug_play_demo command with empty request_id or demo_path");
+                return;
+            }
+            std::vector<std::string> commands;
+            if (payload.contains("commands") && payload["commands"].is_array()) {
+                for (const auto& entry : payload["commands"]) {
+                    if (entry.is_string()) {
+                        commands.push_back(entry.get<std::string>());
+                    }
+                }
+            }
+            Log("Accepted debug_play_demo request id=%s demo=%s commands=%zu", requestID.c_str(), demoPath.c_str(), commands.size());
+            QueueDebugPlayDemo(requestID, demoPath, std::move(commands));
+        }
+        else if (name == "debug_execute") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_execute without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_execute command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("commands") || !payload["commands"].is_array()) {
+                Log("Ignoring debug_execute command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            if (requestID.empty()) {
+                Log("Ignoring debug_execute command with empty request_id");
+                return;
+            }
+            std::vector<std::string> commands;
+            for (const auto& entry : payload["commands"]) {
+                if (entry.is_string()) {
+                    commands.push_back(entry.get<std::string>());
+                }
+            }
+            Log("Accepted debug_execute request id=%s commands=%zu", requestID.c_str(), commands.size());
+            QueueDebugCommands(requestID, std::move(commands));
+        }
+        else if (name == "debug_record_start") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_record_start without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_record_start command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("recording_id") || !payload["recording_id"].is_string() ||
+                !payload.contains("demo_path") || !payload["demo_path"].is_string() ||
+                !payload.contains("take_name") || !payload["take_name"].is_string() ||
+                !payload.contains("commands") || !payload["commands"].is_array()) {
+                Log("Ignoring debug_record_start command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            std::string recordingID = payload["recording_id"];
+            std::string demoPath = payload["demo_path"];
+            std::string takeName = payload["take_name"];
+            if (requestID.empty() || recordingID.empty()) {
+                Log("Ignoring debug_record_start command with empty request_id or recording_id");
+                return;
+            }
+            std::vector<std::string> commands;
+            for (const auto& entry : payload["commands"]) {
+                if (entry.is_string()) {
+                    commands.push_back(entry.get<std::string>());
+                }
+            }
+            Log("Accepted debug_record_start request id=%s recording=%s commands=%zu",
+                requestID.c_str(), recordingID.c_str(), commands.size());
+            QueueDebugRecordStart(requestID, recordingID, demoPath, takeName, std::move(commands));
+        }
+        else if (name == "debug_record_stop") {
+            // Only a host that launched this game with CSDM_DEBUG_SESSION may
+            // use the interactive debug protocol.
+            if (debugSessionID.empty()) {
+                Log("Ignoring debug_record_stop without CSDM_DEBUG_SESSION");
+                return;
+            }
+            if (!msg.contains("payload") || !msg["payload"].is_object()) {
+                Log("Ignoring debug_record_stop command with invalid payload");
+                return;
+            }
+            const auto& payload = msg["payload"];
+            if (!payload.contains("request_id") || !payload["request_id"].is_string() ||
+                !payload.contains("recording_id") || !payload["recording_id"].is_string()) {
+                Log("Ignoring debug_record_stop command with invalid fields");
+                return;
+            }
+            std::string requestID = payload["request_id"];
+            std::string recordingID = payload["recording_id"];
+            if (requestID.empty() || recordingID.empty()) {
+                Log("Ignoring debug_record_stop command with empty request_id or recording_id");
+                return;
+            }
+            Log("Accepted debug_record_stop request id=%s recording=%s", requestID.c_str(), recordingID.c_str());
+            QueueDebugRecordStop(requestID, recordingID);
+        }
         else {
             Log("Ignoring unknown WebSocket command: %s", name.c_str());
         }
@@ -811,9 +1408,19 @@ void ConnectToWebsocketServer() {
     Log("Connected to WebSocket server.");
     wsConnected = true;
     ReplayDurableWebSocketMessages(socket);
+    bool debugReadySent = false;
     while (socket->getReadyState() != WebSocket::CLOSED && !isQuitting) {
         DrainOutboundWebSocketMessages(socket);
         QueueExitAfterWebSocketAck();
+        // The game thread proves command consumption before we announce ready.
+        // A reconnect re-enters this function, so the handshake is resent.
+        if (!debugReadySent && !debugSessionID.empty() && engineCommandReady &&
+            socket->getReadyState() == WebSocket::OPEN) {
+            SendMsg(BuildDebugSessionReadyMessage(debugSessionID, DEBUG_PROTOCOL_VERSION));
+            DrainOutboundWebSocketMessages(socket);
+            debugReadySent = true;
+            Log("Sent debug_session_ready for session %s", debugSessionID.c_str());
+        }
         socket->poll(100);
         socket->dispatch([](const std::string& message) {
             HandleWebSocketMessage(message);
@@ -860,6 +1467,9 @@ bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
 
     g_pCVar = (ICvar*)factory("VEngineCvar007", NULL);
     Log("VEngineCvar007 lookup returned %p", g_pCVar);
+    // Try early installation; debug mode retries if the client appears later.
+    // Engine lookup and the ready signal belong to the consuming game thread.
+    TryInstallClientFrameHook();
     // Required to make the spec_lock_to_accountid command working since the 25/04/2024 update - it looks like the command has been hidden.
     // Also required to use the startmovie command.
     UnhideCommandsAndCvars();
@@ -868,6 +1478,13 @@ bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
     ConVar_Register();
     Log("Registered CSDM console commands");
 #endif
+
+    const char* debugSessionEnv = getenv("CSDM_DEBUG_SESSION");
+    if (debugSessionEnv != NULL && debugSessionEnv[0] != '\0') {
+        debugSessionID = debugSessionEnv;
+        Log("Interactive debug protocol enabled for session %s", debugSessionID.c_str());
+        debugBootstrapThread = new std::thread(BootstrapDebugCommandConsumer);
+    }
 
     Log("Starting WebSocket connection thread");
     wsConnectionThread = new std::thread(ConnectToWebsocketServerLoop);
@@ -882,6 +1499,13 @@ void Shutdown()
 {
     isQuitting = true;
     wsConnected = false;
+
+    // Stop interface lookup/hook installation before tearing down the engine.
+    if (debugBootstrapThread != NULL) {
+        debugBootstrapThread->join();
+        delete debugBootstrapThread;
+        debugBootstrapThread = NULL;
+    }
 
     // Best-effort: remove radar hooks before the rest of teardown.
     RadarPov_Uninstall();
@@ -924,31 +1548,26 @@ void AssertInsecureParameterIsPresent()
 void NewClientFullyConnect(void* thisptr, int playerSlot)
 {
     Log("ClientFullyConnect: playerSlot=%d", playerSlot);
-    if (client != NULL) {
-        originalClientFullyConnect(thisptr, playerSlot);
-        return;
+
+    // Hook FrameStageNotify to call engine commands from the engine thread since
+    // it's not thread safe to call engine commands from another thread. Connect
+    // already attempted this; retry here for clients that only appear later.
+    TryInstallClientFrameHook();
+
+    // One-time initialization for the first fully-connected client. It is
+    // tracked separately from the hook so an early hook install during Connect
+    // does not skip these commands.
+    if (!clientFullyConnectInitialized.exchange(true)) {
+        // Radar POV is opt-in via sequence JSON action "csdm_radar_pov" (idempotent).
+        // Not installed here — avoids default-on and keeps config with other demo actions.
+        RadarPov_SetLogger(&Log);
+        RadarPov_SetEnabled(false);
+
+        // Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
+        // We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
+        QueueEngineCommand("demo_ui_mode 0");
+        QueueEngineCommand("sv_cheats 1"); // required to unlock commands such as getposcopy
     }
-
-    // Hook FrameStageNotify to call engine commands from the engine thread since it's not thread safe to call engine
-    // commands from another thread.
-    client = (ISource2Client*)factory("Source2Client002", NULL);
-    if (client != NULL) {
-        Log("Hooking FrameStageNotify");
-        auto vtable = *(void***)client;
-        originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
-        PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
-        Log("Hooked FrameStageNotify");
-    }
-
-    // Radar POV is opt-in via sequence JSON action "csdm_radar_pov" (idempotent).
-    // Not installed here — avoids default-on and keeps config with other demo actions.
-    RadarPov_SetLogger(&Log);
-    RadarPov_SetEnabled(false);
-
-    // Since the 23/05/2024 CS2 update, the demo playback UI is displayed by default.
-    // We have to set the demo_ui_mode convar to 0 before starting the playback prevent the UI from being displayed.
-    QueueEngineCommand("demo_ui_mode 0");
-    QueueEngineCommand("sv_cheats 1"); // required to unlock commands such as getposcopy
 
     originalClientFullyConnect(thisptr, playerSlot);
 }
