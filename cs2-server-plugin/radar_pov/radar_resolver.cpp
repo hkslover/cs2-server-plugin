@@ -101,6 +101,32 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
             reinterpret_cast<void*>(address), rva(address));
         return address;
     };
+    // Find a 64-bit load from the pawn observer-services field regardless of
+    // which register the compiler chose. This was at the helper's prologue in
+    // older builds, but newer builds inline validation before loading +0x1308.
+    auto hasObserverServicesField = [](const uint8_t* body, size_t size) {
+        for (size_t i = 0; i + 7 <= size; ++i) {
+            const uint8_t rex = body[i];
+            if ((rex & 0xF8) != 0x48 || body[i + 1] != 0x8B ||
+                (body[i + 2] & 0xC0) != 0x80) {
+                continue;
+            }
+            size_t displacementOffset = i + 3;
+            if ((body[i + 2] & 0x07) == 0x04) {
+                // SIB byte precedes disp32 when the memory base is rsp/r12.
+                if (i + 8 > size) {
+                    continue;
+                }
+                ++displacementOffset;
+            }
+            if (displacementOffset + 4 <= size &&
+                body[displacementOffset] == 0x08 && body[displacementOffset + 1] == 0x13 &&
+                body[displacementOffset + 2] == 0x00 && body[displacementOffset + 3] == 0x00) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     // Function-level signatures.  These are deliberately kept separate from
     // the call-chain code so every fallback can be checked against a second
@@ -123,8 +149,6 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
     // between builds, keep it wildcarded.
     static const char kPatFindPlayerBySlotCall[] =
         "8B CF E8 ?? ?? ?? ?? 48 89 44 24 ?? 48 8B D8 48 85 C0";
-    // getObs prologue: mov rcx,[rcx+0x1308] (pawn observer-services field).
-    static const char kPatObserverField[] = "48 8B 89 08 13 00 00";
     // radar_update inlined mode logic clears/sets the shared show-all flag on
     // the radar (rsi) with the same disp32: and/or byte ptr [rsi+disp],0xFE/1.
     static const char kPatShowAllFlagClear[] = "80 A6 ?? ?? ?? ?? FE";
@@ -466,11 +490,9 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
         if (callTarget == getLocalFn || !validFunction(callTarget)) {
             continue;
         }
-        const size_t scanSize = functionSize(callTarget) < 0x20 ? functionSize(callTarget) : 0x20;
-        const auto hits = FindPatternAll(reinterpret_cast<const uint8_t*>(callTarget), scanSize,
-                                         kPatObserverField,
-                                         std::numeric_limits<size_t>::max());
-        if (hits.size() == 1) {
+        const size_t scanSize = functionSize(callTarget);
+        const auto* body = reinterpret_cast<const uint8_t*>(callTarget);
+        if (hasObserverServicesField(body, scanSize)) {
             observerCandidates.push_back(callTarget);
         }
     }
@@ -525,13 +547,82 @@ bool ResolveRadarFunctions(const ModuleInfo& client, ResolvedState& resolved)
         resolvePlayerCall("getPlayerSlot", kPatGetPlayerSlotCall, 8);
     const uintptr_t findPlayerBySlotFn =
         resolvePlayerCall("findPlayerBySlot", kPatFindPlayerBySlotCall, 2);
-    // Players-loop draw gate: `mov edx,[rsp+28]; mov rcx,[rsp+38]; call` — the
-    // per-slot "is this player an enemy of local" predicate (0x1808b0e00
-    // class). During demo playback its cvar path (0x182339278 != 0) returns true
-    // for every non-self slot, hiding unspotted teammates; the hook restores the
-    // live branch (team comparison).
-    const uintptr_t isSlotEnemyOfFn =
-        resolvePlayerCall("isSlotEnemyOf", "8B 54 24 28 48 8B 4C 24 38 E8", 9);
+    // The draw gate receives the converted player index in edx and the local
+    // pawn in rcx. Its local-pawn stack slot moved from rsp-relative to
+    // rbp-relative addressing in newer builds, so resolve the following
+    // stack-load instruction and its call instead of pinning the displacement.
+    auto resolveSlotEnemyOf = [&]() -> uintptr_t {
+        const uint8_t* playersBody = reinterpret_cast<const uint8_t*>(radarPlayersFn);
+        const size_t playersSize = functionSize(radarPlayersFn);
+        const auto hits = FindPatternAll(playersBody, playersSize, "8B 54 24 28 48 8B",
+                                         std::numeric_limits<size_t>::max());
+        std::vector<uintptr_t> targets;
+        size_t callSites = 0;
+        for (const uint8_t* hit : hits) {
+            const size_t hitOffset = static_cast<size_t>(hit - playersBody);
+            if (hitOffset + 8 > playersSize) {
+                continue;
+            }
+            const uint8_t modrm = hit[6];
+            const uint8_t mod = static_cast<uint8_t>((modrm >> 6) & 0x03);
+            const uint8_t reg = static_cast<uint8_t>((modrm >> 3) & 0x07);
+            const uint8_t rm = static_cast<uint8_t>(modrm & 0x07);
+            if ((mod != 1 && mod != 2) || reg != 1) {
+                continue;
+            }
+
+            size_t loadSize = 3;  // REX.W + MOV + ModRM, after the 4-byte edx load.
+            if (rm == 4) {
+                // SIB form must address rsp (no index), as in the prior build.
+                const uint8_t sib = hit[7];
+                if ((sib & 0x07) != 0x04 || ((sib >> 3) & 0x07) != 0x04) {
+                    continue;
+                }
+                ++loadSize;
+            } else if (rm != 5) {
+                // Accept only rsp/rbp frame-local loads into rcx.
+                continue;
+            }
+            loadSize += mod == 1 ? 1 : 4;  // disp8 / disp32
+            const size_t callOffset = 4 + loadSize;
+            if (hitOffset + callOffset + 5 > playersSize || hit[callOffset] != 0xE8) {
+                continue;
+            }
+
+            ++callSites;
+            uintptr_t target = 0;
+            const uint8_t* callInsn = hit + callOffset;
+            if (!DecodeRel32Call(callInsn, reinterpret_cast<uintptr_t>(callInsn), target) ||
+                !validFunction(target)) {
+                continue;
+            }
+            bool duplicate = false;
+            for (uintptr_t candidate : targets) {
+                if (candidate == target) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                targets.push_back(target);
+            }
+        }
+        Log("Radar POV: isSlotEnemyOf call relationship candidates=%zu (frame-local gate sites=%zu, "
+            "pattern hits=%zu)",
+            targets.size(), callSites, hits.size());
+        if (targets.size() != 1) {
+            Log("Radar POV: isSlotEnemyOf resolver rejected (%s)",
+                targets.empty() ? "not found" : "ambiguous");
+            return 0;
+        }
+        logResolved("isSlotEnemyOf", targets[0],
+                    "radar_players converted index + local-pawn stack argument", 1);
+        return targets[0];
+    };
+    // During demo playback the engine's demo-session path treats every
+    // non-self slot as an enemy and hides unspotted teammates. The hook restores
+    // the live team-comparison branch.
+    const uintptr_t isSlotEnemyOfFn = resolveSlotEnemyOf();
     if (getPlayerSlotFn == 0 || findPlayerBySlotFn == 0 || isSlotEnemyOfFn == 0) {
         return false;
     }

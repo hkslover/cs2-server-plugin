@@ -182,6 +182,54 @@ fallback `playerIndex % 5` if unset; `GetCompColorArgb` → SetColor on panels
 - Lazy refresh in `IsPovTeammateTeam` if still invalid.
 - Never competitive-colour enemies.
 
+## Latest supplied client.dll (PE `0x6AD01314`, static validation 2026-10-15)
+
+The supplied `dll/client.dll` is PE timestamp `0x6AD01314`. The plugin log
+reported `getObserverTarget candidates=0` and aborted before installing any
+hooks, so it contains no POV-frame runtime evidence. The offline resolver now
+passes against this binary, and the project owner subsequently confirmed the
+POV functional test passes on the updated build. A refreshed healthy runtime
+log has not been captured here.
+
+### PE `0x6AD01314` RVA quick map (image base `0x180000000`)
+
+| Function / global | RVA |
+| --- | --- |
+| radar_update | `0xEAF120` |
+| players loop | `0xEBE8C0` |
+| getLocal | `0xC7C160` |
+| getObs | `0xC7BB40` |
+| getPlayerSlot | `0x942470` |
+| findPlayerBySlot | `0xACAC70` |
+| GetEntityBySlot | `0x96A8B0` |
+| IsSlotEnemyOf | `0x8D9290` |
+| SetRadarIconType | `0xEC58C0` |
+| RadarIconColor | `0xED3220` |
+| GetCompColorArgb | `0x889BD0` |
+| ResolvePlayerByIndex | `0xACB010` |
+| demo/HLTV state global slot | `0x2560ED0` |
+| show-all flag | `radar+0x17808` bit 0 |
+
+The resolver regression was structural, not a changed radar hook design:
+
+- `getObs` now performs player-pawn validation before loading observer services
+  at `pawn+0x1308` (`0xC7BB79`); that field load is no longer in the first
+  `0x20` bytes. Resolver matching scans the full direct-callee function body
+  and recognizes the field displacement independent of the destination
+  register.
+- `IsSlotEnemyOf`'s local-pawn argument moved from an `rsp`-relative load to an
+  `rbp`-relative load. The resolver now follows the converted-index argument,
+  stack-local `rcx` load, and direct call rather than pinning one stack offset.
+- `tools/run-radar-resolver-check.sh` → PASS on the supplied binary. Rechecked
+  code anchors include pawn vtable slots `+0x4F0/+0xAC0/+0xAB8`, observer
+  services `+0x1308`, `m_iTeamNum +0x3E7`, `m_iCompTeammateColor +0x858`,
+  `m_bPawnIsAlive +0x934`, life state `+0x6F4`, icon `+0x158/+0x14C/+0x16C`,
+  and comp-allowed flag `+0x17D`.
+
+The following prior build remains the detailed healthy-log reference. The
+updated build's normal POV functionality is confirmed, but its runtime log has
+not yet been captured:
+
 ## Last known-good anchors (PE `0x6AC7FFFA`, client.dll 2026-10-09 — validated in-game 2026-10-10)
 
 Resolver re-validated statically against this build (2026-10-09, offline
