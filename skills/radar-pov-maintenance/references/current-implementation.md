@@ -186,9 +186,10 @@ fallback `playerIndex % 5` if unset; `GetCompColorArgb` → SetColor on panels
 
 The supplied `dll/client.dll` is PE timestamp `0x6AD01314`. The plugin log
 reported `getObserverTarget candidates=0` and aborted before installing any
-hooks, so there is no first POV-frame runtime evidence in that log. The offline
-resolver now passes against this binary; **in-game behaviour is not yet
-validated**.
+hooks, so it contains no POV-frame runtime evidence. The offline resolver now
+passes against this binary, and the project owner subsequently confirmed the
+POV functional test passes on the updated build. A refreshed healthy runtime
+log has not been captured here.
 
 ### PE `0x6AD01314` RVA quick map (image base `0x180000000`)
 
@@ -225,8 +226,9 @@ The resolver regression was structural, not a changed radar hook design:
   `m_bPawnIsAlive +0x934`, life state `+0x6F4`, icon `+0x158/+0x14C/+0x16C`,
   and comp-allowed flag `+0x17D`.
 
-Keep the following as the last **in-game validated** baseline until a demo is
-run on PE `0x6AD01314`:
+The following prior build remains the detailed healthy-log reference. The
+updated build's normal POV functionality is confirmed, but its runtime log has
+not yet been captured:
 
 ## Last known-good anchors (PE `0x6AC7FFFA`, client.dll 2026-10-09 — validated in-game 2026-10-10)
 
