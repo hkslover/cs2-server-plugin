@@ -138,10 +138,15 @@ Output:
 
 - `static/cs2/server.dll`
 
-Run the portable playback-confirmation and debug-protocol regression checks
+Run the portable core-interface, playback-confirmation and debug-protocol regression checks
 from a Visual Studio Developer PowerShell (the tests do not load CS2):
 
 ```powershell
+cl /nologo /EHsc /W4 /WX tests/core_interfaces_test.cpp "/Fo:$env:TEMP/csdm-core-interfaces-test.obj" "/Fe:$env:TEMP/csdm-core-interfaces-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Core interface regression test build failed" }
+& "$env:TEMP/csdm-core-interfaces-test.exe"
+if ($LASTEXITCODE -ne 0) { throw "Core interface regression test failed" }
+
 cl /nologo /EHsc /W4 /WX tests/debug_playback_test.cpp "/Fo:$env:TEMP/csdm-debug-playback-test.obj" "/Fe:$env:TEMP/csdm-debug-playback-test.exe"
 if ($LASTEXITCODE -ne 0) { throw "Playback regression test build failed" }
 & "$env:TEMP/csdm-debug-playback-test.exe"
@@ -154,9 +159,21 @@ if ($LASTEXITCODE -ne 0) { throw "Debug protocol test failed" }
 ```
 
 The same tests can be compiled with `clang++ -std=c++14` on macOS/Linux. These
-checks cover path/replay confirmation and the `debug_demo_state` wire format;
+checks cover the declared Windows engine slots, all five `ExecuteClientCmd`
+arguments (including the default NaN input time and zero timestamp), path/replay
+confirmation and the `debug_demo_state` wire format;
 actual engine path reporting, engine pause observation and command application
 timing still require Windows HLAE/CS2 validation.
+
+For the November 11, 2026 CS2 update, rebuild the DLL before testing production.
+Confirm `csdm.log` contains `Core compatibility: CS2 2026-11-11, ExecuteClientCmd ABI 5 args`
+to distinguish it from an older installed DLL. Test the failing Demo through its
+first recording start, recording end, `demo_done`, and orderly exit. The startup
+and first loaded Demo probes identify the native call reached if it still exits.
+The host's WebSocket `demo_started` event acknowledges a queued request; it does
+not establish that the engine has loaded the Demo. See the
+[adaptation record](skills/cs2-game-update-adaptation/references/current-adaptation.md)
+for the source evidence and remaining game validation.
 
 ## Release automation
 

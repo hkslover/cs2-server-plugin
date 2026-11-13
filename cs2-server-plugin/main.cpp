@@ -77,7 +77,7 @@ struct Sequence {
 };
 
 typedef bool (*AppSystemConnectFn)(IAppSystem* appSystem, CreateInterfaceFn factory);
-typedef void (*AppSystemShutdownFn)();
+typedef void (*AppSystemShutdownFn)(IAppSystem* appSystem);
 typedef void (*FrameStageNotifyFn)(void* thisptr, ClientFrameStage_t curStage);
 typedef void (*ClientFullyConnectFn)(void* thisptr, int playerSlot);
 
@@ -658,6 +658,9 @@ ISource2EngineToClient* GetEngine()
     }
 
     engineToClient = (ISource2EngineToClient*)factory("Source2EngineToClient001", NULL);
+    if (engineToClient != NULL) {
+        Log("Source2EngineToClient001 resolved: %p (ExecuteClientCmd slot 51, ABI 5 args)", engineToClient);
+    }
 
     return engineToClient;
 }
@@ -1017,7 +1020,26 @@ void NewFrameStageNotify(void* thisptr, ClientFrameStage_t stage)
         }
     }
 
+    static bool loggedFirstDemoLookup = false;
+    if (!loggedFirstDemoLookup) {
+        Log("First frame demo probe: GetDemoFile slot 69 entered");
+    }
     auto demo = engine->GetDemoFile();
+    if (!loggedFirstDemoLookup) {
+        Log("First frame demo probe: GetDemoFile returned %p", demo);
+        loggedFirstDemoLookup = true;
+    }
+    static bool loggedFirstDemoProbe = false;
+    if (demo != NULL && !loggedFirstDemoProbe) {
+        Log("First loaded demo probe: GetDemoFile returned %p", demo);
+        Log("First loaded demo probe: GetDemoTick slot 3 entered");
+        const int tick = demo->GetDemoTick();
+        Log("First loaded demo probe: GetDemoTick returned %d", tick);
+        Log("First loaded demo probe: IsPlayingDemo slot 42 entered");
+        const bool playing = engine->IsPlayingDemo();
+        Log("First loaded demo probe: IsPlayingDemo returned %d", playing);
+        loggedFirstDemoProbe = true;
+    }
     if (!debugSessionID.empty()) {
         // Observe the actual engine path, including requests while another
         // Demo is still playing. Do not relabel its frames as the new Demo.
@@ -1165,7 +1187,7 @@ static bool TryInstallClientFrameHook()
     if (candidate == NULL) {
         return false;
     }
-    Log("Hooking FrameStageNotify");
+    Log("Hooking FrameStageNotify: client=%p slot=36 stage=12", candidate);
     auto vtable = *(void***)candidate;
     originalFrameStageNotify = (FrameStageNotifyFn)vtable[36];
     PatchVTableEntry(vtable, 36, (void*)&NewFrameStageNotify);
@@ -1464,6 +1486,10 @@ bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
     }
     bool result = serverConfigConnect(appSystem, factory);
     Log("Source2ServerConfig001::Connect returned %d", result);
+    if (!result) {
+        return false;
+    }
+    Log("Core compatibility: CS2 2026-11-11, ExecuteClientCmd ABI 5 args");
 
     g_pCVar = (ICvar*)factory("VEngineCvar007", NULL);
     Log("VEngineCvar007 lookup returned %p", g_pCVar);
@@ -1495,7 +1521,7 @@ bool Connect(IAppSystem* appSystem, CreateInterfaceFn factoryFn)
 }
 
 
-void Shutdown()
+void Shutdown(IAppSystem* appSystem)
 {
     isQuitting = true;
     wsConnected = false;
@@ -1511,12 +1537,15 @@ void Shutdown()
     RadarPov_Uninstall();
 
     if (serverConfigShutdown != NULL) {
-        serverConfigShutdown();
+        serverConfigShutdown(appSystem);
     }
 
 #ifdef CON_COMMAND_ENABLED
     ConVar_Unregister();
 #endif
+    // Static ConCommands are destroyed after the engine's CVar system. Their
+    // destructors must not call through the now-stale interface during unload.
+    g_pCVar = NULL;
 
     if (wsConnectionThread != NULL) {
         wsConnectionThread->join();
@@ -1603,6 +1632,10 @@ EXPORT void* CreateInterface(const char* pName, int* pReturnCode)
     }
 
     void* original = serverCreateInterface(pName, pReturnCode);
+    if (original == NULL) {
+        Log("serverCreateInterface returned NULL for %s", pName);
+        return NULL;
+    }
     auto vtable = *(void***)original;
     if (strcmp(pName, "Source2ServerConfig001") == 0)
     {

@@ -1,3 +1,5 @@
+#pragma once
+
 //===== Copyright 1996-2005, Valve Corporation, All rights reserved. ======//
 //
 // Purpose: Interfaces between the client.dll and engine
@@ -5,16 +7,18 @@
 //===========================================================================//
 
 // Credits @dtugend https://github.com/advancedfx/advancedfx-prop/blob/prop/cs2/sdk_src/public/cdll_int.h
-// Updated for CS2 Update #1186 (2026-07-09) - vtable shifts due to new GetDemoFilePath and GetDemoStartTick
-#include "interface.h"
+// Windows ABI checked against cs-demo-manager 63257efa (2026-11-11 CS2 update)
+// and advancedfx-prop 43f0981b. Keep this narrow interface independent of the SDK.
+#include <cmath>
+#include <cstdint>
 
-abstract_class IDemoFile
+class IDemoFile
 {
 public:
     virtual void _Unknown_000(void) = 0;
     virtual void _Unknown_001(void) = 0;
     virtual int GetDemoStartTick(void) = 0; //:002 (NEW in CS2 Update #1186)
-    virtual int GetDemoTick(void) = 0; //:003 (same on both Windows and Linux now)
+    virtual int GetDemoTick(void) = 0; //:003 (Windows; Linux Demo ABI not adapted here)
     virtual void _Unknown_004(void) = 0;
     virtual void _Unknown_005(void) = 0;
     virtual void _Unknown_006(void) = 0;
@@ -27,7 +31,7 @@ public:
 };
 
 
-abstract_class ISource2EngineToClient
+class ISource2EngineToClient
 {
 public:
     virtual void _Unknown_000(void) = 0;
@@ -67,21 +71,25 @@ public:
     virtual void _Unknown_034(void) = 0;
     virtual void _Unknown_035(void) = 0;
     virtual void _Unknown_036(void) = 0;
-    virtual int GetMaxClients(void) = 0; //:037
-    virtual bool IsInGame(void) = 0; //:038
-    virtual bool IsConnected(void) = 0; //:039
-    virtual void _Unknown_040(void) = 0;
+    virtual int _Unknown_037(void) = 0; // Client state, -1 without one
+    virtual int GetMaxClients(void) = 0; //:038
+    virtual bool IsInGame(void) = 0; //:039
+    virtual bool IsConnected(void) = 0; //:040
     virtual void _Unknown_041(void) = 0;
     virtual bool IsPlayingDemo(void) = 0; //:042
     virtual const char* GetDemoFilePath(void) = 0; //:043 (NEW in CS2 Update #1186)
-    virtual void _Unknown_044(void) = 0; // shifted from old :043
-    virtual bool IsRecordingDemo(void) = 0; //:045 shifted from old :044
+    virtual bool IsRecordingDemo(void) = 0; //:044
+    virtual void _Unknown_045(void) = 0;
     virtual void _Unknown_046(void) = 0; // shifted from old :045 (Demo related)
     virtual void _Unknown_047(void) = 0;
     virtual void _Unknown_048(void) = 0;
     virtual void _Unknown_049(void) = 0;
     virtual void _Unknown_050(void) = 0;
-    virtual void ExecuteClientCmd(int iUnk0MaybeSplitScreenSlotSetTo0, const char* pszCommands, bool bUnk2SetToTrue) = 0; //:051 shifted from old :050
+    // Commands without a physical key event use NaN input time and timestamp 0.
+    // Both trailing arguments are required by the native ABI, even when callers
+    // use defaults. The old three-argument declaration passed stack garbage.
+    virtual void ExecuteClientCmd(int iUnk0MaybeSplitScreenSlotSetTo0, const char* pszCommands,
+        bool bUnk2SetToTrue, double flInputTime = NAN, std::uint64_t nSDLTimestamp = 0) = 0; //:051
     virtual void _Unknown_052(void) = 0;
     virtual void _Unknown_053(void) = 0;
     virtual void _Unknown_054(void) = 0;
@@ -111,7 +119,7 @@ enum class ClientFrameStage_t : int
 };
 
 
-abstract_class ISource2Client
+class ISource2Client
 {
 public:
     virtual void _Unknown_000(void) = 0;
